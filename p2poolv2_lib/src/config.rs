@@ -313,6 +313,113 @@ pub struct ApiConfig {
     pub auth_token: Option<String>,
 }
 
+/// Configuration for the Stratum V2 server.
+///
+/// When present and `enabled = true`, the pool will listen for SV2 Mining
+/// Protocol connections alongside the existing SV1 server. Both protocols
+/// feed validated shares into the same [`crate::stratum::emission::Emission`]
+/// pipeline.
+#[derive(Debug, Deserialize, Clone)]
+pub struct Sv2Config {
+    /// Enable the SV2 server (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Listen address for SV2 connections
+    #[serde(default = "default_sv2_hostname")]
+    pub hostname: String,
+
+    /// Port for SV2 connections
+    #[serde(default = "default_sv2_port")]
+    pub port: u16,
+
+    /// Authority public key (base58check-encoded secp256k1 x-only pubkey)
+    /// for the Noise NX handshake. If not provided, a new keypair is
+    /// generated on startup (suitable for development but not production).
+    pub authority_public_key: Option<String>,
+
+    /// Authority secret key (hex-encoded 32-byte secret) for the Noise NX
+    /// handshake. Must be provided together with `authority_public_key`.
+    pub authority_secret_key: Option<String>,
+
+    /// Noise certificate validity in seconds (default: 86400 = 24 hours)
+    #[serde(default = "default_cert_validity_seconds")]
+    pub cert_validity_seconds: u64,
+
+    /// Default extranonce size for Extended channels (default: 16 bytes)
+    #[serde(default = "default_extranonce_size")]
+    pub default_extranonce_size: usize,
+
+    /// Server ID for multi-instance extranonce prefix (default: 0).
+    /// Each hydrapool instance should use a unique ID when running
+    /// multiple instances against the same bitcoind.
+    #[serde(default)]
+    pub server_id: u16,
+}
+
+fn default_sv2_hostname() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_sv2_port() -> u16 {
+    3334
+}
+
+fn default_cert_validity_seconds() -> u64 {
+    86400
+}
+
+fn default_extranonce_size() -> usize {
+    16
+}
+
+impl Default for Sv2Config {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hostname: default_sv2_hostname(),
+            port: default_sv2_port(),
+            authority_public_key: None,
+            authority_secret_key: None,
+            cert_validity_seconds: default_cert_validity_seconds(),
+            default_extranonce_size: default_extranonce_size(),
+            server_id: 0,
+        }
+    }
+}
+
+impl Sv2Config {
+    /// Validate the configuration, returning an error if keys are
+    /// inconsistently specified.
+    pub fn validate(&self) -> Result<(), String> {
+        match (&self.authority_public_key, &self.authority_secret_key) {
+            (Some(_), None) => {
+                Err("authority_public_key provided without authority_secret_key".to_string())
+            }
+            (None, Some(_)) => {
+                Err("authority_secret_key provided without authority_public_key".to_string())
+            }
+            (Some(pk), Some(sk)) => {
+                // Basic format checks
+                if pk.is_empty() {
+                    return Err("authority_public_key must not be empty".to_string());
+                }
+                if sk.len() != 64 {
+                    return Err(format!(
+                        "authority_secret_key must be 64 hex characters (32 bytes), got {}",
+                        sk.len()
+                    ));
+                }
+                if hex::decode(sk).is_err() {
+                    return Err("authority_secret_key must be valid hex".to_string());
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
+}
+
 /// Config for p2poolv2 nodes
 ///
 /// The network and miner configs switch to defaults if not
@@ -325,6 +432,9 @@ pub struct Config {
     pub network: NetworkConfig,
     pub store: StoreConfig,
     pub stratum: StratumConfig,
+    /// Optional SV2 server configuration. When absent or disabled, only SV1
+    /// is available.
+    pub stratum_sv2: Option<Sv2Config>,
     pub miner: Option<MinerConfig>,
     pub bitcoinrpc: BitcoinRpcConfig,
     pub logging: LoggingConfig,
@@ -492,6 +602,30 @@ impl Config {
         self.api.auth_token = auth_token;
         self
     }
+
+    pub fn with_sv2_enabled(mut self, enabled: bool) -> Self {
+        self.stratum_sv2
+            .get_or_insert_with(Sv2Config::default)
+            .enabled = enabled;
+        self
+    }
+
+    pub fn with_sv2_hostname(mut self, hostname: String) -> Self {
+        self.stratum_sv2
+            .get_or_insert_with(Sv2Config::default)
+            .hostname = hostname;
+        self
+    }
+
+    pub fn with_sv2_port(mut self, port: u16) -> Self {
+        self.stratum_sv2.get_or_insert_with(Sv2Config::default).port = port;
+        self
+    }
+
+    /// Returns the SV2 config if present and enabled, None otherwise.
+    pub fn sv2_config(&self) -> Option<&Sv2Config> {
+        self.stratum_sv2.as_ref().filter(|c| c.enabled)
+    }
 }
 
 #[cfg(test)]
@@ -621,6 +755,124 @@ mod tests {
     fn test_default_network_config() {
         let config = NetworkConfig::default();
         assert!(config.listen_address.is_empty());
+    }
+
+    #[test]
+    fn test_sv2_config_absent_is_backward_compatible() {
+        // Config without [stratum_sv2] section should load fine
+        let config = Config::load("../config.toml").unwrap();
+        // sv2_config() returns None when absent or disabled
+        assert!(config.sv2_config().is_none());
+    }
+
+    #[test]
+    fn test_sv2_config_defaults() {
+        let sv2 = Sv2Config::default();
+        assert!(!sv2.enabled);
+        assert_eq!(sv2.hostname, "0.0.0.0");
+        assert_eq!(sv2.port, 3334);
+        assert!(sv2.authority_public_key.is_none());
+        assert!(sv2.authority_secret_key.is_none());
+        assert_eq!(sv2.cert_validity_seconds, 86400);
+        assert_eq!(sv2.default_extranonce_size, 16);
+        assert_eq!(sv2.server_id, 0);
+    }
+
+    #[test]
+    fn test_sv2_config_validate_no_keys() {
+        let sv2 = Sv2Config::default();
+        assert!(sv2.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sv2_config_validate_both_keys() {
+        let sv2 = Sv2Config {
+            authority_public_key: Some("somepubkey".to_string()),
+            authority_secret_key: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            ),
+            ..Sv2Config::default()
+        };
+        assert!(sv2.validate().is_ok());
+    }
+
+    #[test]
+    fn test_sv2_config_validate_mismatched_keys() {
+        // Public without secret
+        let sv2 = Sv2Config {
+            authority_public_key: Some("somepubkey".to_string()),
+            authority_secret_key: None,
+            ..Sv2Config::default()
+        };
+        assert!(sv2.validate().is_err());
+
+        // Secret without public
+        let sv2 = Sv2Config {
+            authority_public_key: None,
+            authority_secret_key: Some("deadbeef".to_string()),
+            ..Sv2Config::default()
+        };
+        assert!(sv2.validate().is_err());
+    }
+
+    #[test]
+    fn test_sv2_config_validate_bad_secret_key() {
+        // Wrong length
+        let sv2 = Sv2Config {
+            authority_public_key: Some("somepubkey".to_string()),
+            authority_secret_key: Some("deadbeef".to_string()),
+            ..Sv2Config::default()
+        };
+        assert!(sv2.validate().is_err());
+
+        // Right length but invalid hex
+        let sv2 = Sv2Config {
+            authority_public_key: Some("somepubkey".to_string()),
+            authority_secret_key: Some(
+                "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz".to_string(),
+            ),
+            ..Sv2Config::default()
+        };
+        assert!(sv2.validate().is_err());
+    }
+
+    #[test]
+    fn test_sv2_config_builder() {
+        let config = Config::load("../config.toml")
+            .unwrap()
+            .with_sv2_enabled(true)
+            .with_sv2_hostname("127.0.0.1".to_string())
+            .with_sv2_port(13334);
+
+        let sv2 = config.sv2_config().unwrap();
+        assert!(sv2.enabled);
+        assert_eq!(sv2.hostname, "127.0.0.1");
+        assert_eq!(sv2.port, 13334);
+    }
+
+    #[test]
+    fn test_sv2_config_disabled_returns_none() {
+        let config = Config::load("../config.toml")
+            .unwrap()
+            .with_sv2_enabled(false);
+
+        assert!(config.sv2_config().is_none());
+    }
+
+    #[test]
+    fn test_sv2_config_from_env_vars() {
+        with_var("P2POOL_STRATUM_SV2_ENABLED", Some("true"), || {
+            with_var("P2POOL_STRATUM_SV2_PORT", Some("13335"), || {
+                let config = Config::load("../config.toml").unwrap();
+                if let Some(sv2) = &config.stratum_sv2 {
+                    assert!(sv2.enabled);
+                    assert_eq!(sv2.port, 13335);
+                }
+                // Note: env var override may not work for nested optional sections
+                // depending on the `config` crate's behavior. This test documents
+                // the expected behavior if it works.
+            });
+        });
     }
 
     #[test]

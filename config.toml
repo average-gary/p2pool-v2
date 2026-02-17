@@ -50,6 +50,20 @@ difficulty_multiplier = 1.0
 # to add a pool signature. Maximum length 16 bytes.
 pool_signature = "P2Poolv2"
 
+# Stratum V2 Mining Protocol (optional, disabled by default)
+# Runs alongside the SV1 server on a separate port.
+# [stratum_sv2]
+# enabled = true
+# hostname = "0.0.0.0"
+# port = 3334
+# Noise NX keypair for encrypted connections. If omitted, a fresh
+# keypair is generated on each startup (fine for development).
+# authority_public_key = "<base58check-encoded x-only pubkey>"
+# authority_secret_key = "<64 hex chars (32 bytes)>"
+# cert_validity_seconds = 86400
+# default_extranonce_size = 16
+# server_id = 0
+
 [miner]
 pubkey = "020202020202020202020202020202020202020202020202020202020202020202"
 

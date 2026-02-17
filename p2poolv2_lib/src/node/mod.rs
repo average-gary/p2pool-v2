@@ -547,6 +547,7 @@ mod tests {
                 auth_user: None,
                 auth_token: None,
             },
+            stratum_sv2: None,
         };
         config.network = network_config;
 
