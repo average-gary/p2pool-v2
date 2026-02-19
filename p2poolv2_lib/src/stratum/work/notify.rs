@@ -48,7 +48,7 @@ use crate::stratum::client_connections::ClientConnectionsHandle;
 /// Extract flags from template coinbaseaux and convert to PushBytesBuf
 /// If flags are empty, use a single byte with value 0
 #[allow(dead_code)]
-fn parse_flags(flags: Option<String>) -> PushBytesBuf {
+pub(crate) fn parse_flags(flags: Option<String>) -> PushBytesBuf {
     match flags {
         Some(flags) if flags.is_empty() => PushBytesBuf::from(&[0u8]),
         Some(flags) => PushBytesBuf::try_from(hex::decode(flags).unwrap()).unwrap(),

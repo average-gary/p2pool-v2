@@ -27,12 +27,14 @@
 //! - [`connections`] - Connection registry actor for tracking and broadcasting to SV2 clients
 //! - [`error`] - Error types for the SV2 subsystem
 //! - [`setup`] - SetupConnection message handler
+//! - [`work`] - GBT block template to SV2 job conversion
 
 pub mod channels;
 pub mod connection;
 pub mod connections;
 pub mod error;
 pub mod setup;
+pub mod work;
 
 #[cfg(test)]
 mod tests {
