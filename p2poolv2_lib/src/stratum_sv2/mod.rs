@@ -26,6 +26,7 @@
 //! - [`connection`] - TCP listener, Noise NX handshake, per-connection read/write tasks
 //! - [`connections`] - Connection registry actor for tracking and broadcasting to SV2 clients
 //! - [`error`] - Error types for the SV2 subsystem
+//! - [`job_distributor`] - Job distribution actor (template -> channels)
 //! - [`setup`] - SetupConnection message handler
 //! - [`work`] - GBT block template to SV2 job conversion
 
@@ -33,6 +34,7 @@ pub mod channels;
 pub mod connection;
 pub mod connections;
 pub mod error;
+pub mod job_distributor;
 pub mod setup;
 pub mod work;
 
