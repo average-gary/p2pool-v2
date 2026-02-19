@@ -19,6 +19,18 @@
 //! This module implements the pool-side SV2 Mining Protocol, running alongside
 //! the existing SV1 stratum server. Both protocols feed validated shares into
 //! the shared [`crate::stratum::emission::Emission`] pipeline.
+//!
+//! # Module Structure
+//!
+//! - [`connection`] - TCP listener, Noise NX handshake, per-connection read/write tasks
+//! - [`connections`] - Connection registry actor for tracking and broadcasting to SV2 clients
+//! - [`error`] - Error types for the SV2 subsystem
+//! - [`setup`] - SetupConnection message handler
+
+pub mod connection;
+pub mod connections;
+pub mod error;
+pub mod setup;
 
 #[cfg(test)]
 mod tests {
