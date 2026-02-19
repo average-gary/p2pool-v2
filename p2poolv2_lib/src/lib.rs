@@ -25,6 +25,7 @@ pub mod service;
 pub mod shares;
 pub mod store;
 pub mod stratum;
+#[cfg(feature = "sv2")]
 pub mod stratum_sv2;
 pub mod utils;
 

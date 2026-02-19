@@ -547,6 +547,7 @@ mod tests {
                 auth_user: None,
                 auth_token: None,
             },
+            #[cfg(feature = "sv2")]
             stratum_sv2: None,
         };
         config.network = network_config;

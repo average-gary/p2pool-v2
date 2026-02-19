@@ -313,6 +313,7 @@ pub struct ApiConfig {
     pub auth_token: Option<String>,
 }
 
+#[cfg(feature = "sv2")]
 /// Configuration for the Stratum V2 server.
 ///
 /// When present and `enabled = true`, the pool will listen for SV2 Mining
@@ -357,22 +358,27 @@ pub struct Sv2Config {
     pub server_id: u16,
 }
 
+#[cfg(feature = "sv2")]
 fn default_sv2_hostname() -> String {
     "0.0.0.0".to_string()
 }
 
+#[cfg(feature = "sv2")]
 fn default_sv2_port() -> u16 {
     3334
 }
 
+#[cfg(feature = "sv2")]
 fn default_cert_validity_seconds() -> u64 {
     86400
 }
 
+#[cfg(feature = "sv2")]
 fn default_extranonce_size() -> usize {
     16
 }
 
+#[cfg(feature = "sv2")]
 impl Default for Sv2Config {
     fn default() -> Self {
         Self {
@@ -388,6 +394,7 @@ impl Default for Sv2Config {
     }
 }
 
+#[cfg(feature = "sv2")]
 impl Sv2Config {
     /// Validate the configuration, returning an error if keys are
     /// inconsistently specified.
@@ -434,6 +441,7 @@ pub struct Config {
     pub stratum: StratumConfig,
     /// Optional SV2 server configuration. When absent or disabled, only SV1
     /// is available.
+    #[cfg(feature = "sv2")]
     pub stratum_sv2: Option<Sv2Config>,
     pub miner: Option<MinerConfig>,
     pub bitcoinrpc: BitcoinRpcConfig,
@@ -603,6 +611,7 @@ impl Config {
         self
     }
 
+    #[cfg(feature = "sv2")]
     pub fn with_sv2_enabled(mut self, enabled: bool) -> Self {
         self.stratum_sv2
             .get_or_insert_with(Sv2Config::default)
@@ -610,6 +619,7 @@ impl Config {
         self
     }
 
+    #[cfg(feature = "sv2")]
     pub fn with_sv2_hostname(mut self, hostname: String) -> Self {
         self.stratum_sv2
             .get_or_insert_with(Sv2Config::default)
@@ -617,12 +627,14 @@ impl Config {
         self
     }
 
+    #[cfg(feature = "sv2")]
     pub fn with_sv2_port(mut self, port: u16) -> Self {
         self.stratum_sv2.get_or_insert_with(Sv2Config::default).port = port;
         self
     }
 
     /// Returns the SV2 config if present and enabled, None otherwise.
+    #[cfg(feature = "sv2")]
     pub fn sv2_config(&self) -> Option<&Sv2Config> {
         self.stratum_sv2.as_ref().filter(|c| c.enabled)
     }
@@ -757,6 +769,7 @@ mod tests {
         assert!(config.listen_address.is_empty());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_absent_is_backward_compatible() {
         // Config without [stratum_sv2] section should load fine
@@ -765,6 +778,7 @@ mod tests {
         assert!(config.sv2_config().is_none());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_defaults() {
         let sv2 = Sv2Config::default();
@@ -778,12 +792,14 @@ mod tests {
         assert_eq!(sv2.server_id, 0);
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_validate_no_keys() {
         let sv2 = Sv2Config::default();
         assert!(sv2.validate().is_ok());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_validate_both_keys() {
         let sv2 = Sv2Config {
@@ -796,6 +812,7 @@ mod tests {
         assert!(sv2.validate().is_ok());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_validate_mismatched_keys() {
         // Public without secret
@@ -815,6 +832,7 @@ mod tests {
         assert!(sv2.validate().is_err());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_validate_bad_secret_key() {
         // Wrong length
@@ -836,6 +854,7 @@ mod tests {
         assert!(sv2.validate().is_err());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_builder() {
         let config = Config::load("../config.toml")
@@ -850,6 +869,7 @@ mod tests {
         assert_eq!(sv2.port, 13334);
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_disabled_returns_none() {
         let config = Config::load("../config.toml")
@@ -859,6 +879,7 @@ mod tests {
         assert!(config.sv2_config().is_none());
     }
 
+    #[cfg(feature = "sv2")]
     #[test]
     fn test_sv2_config_from_env_vars() {
         with_var("P2POOL_STRATUM_SV2_ENABLED", Some("true"), || {
