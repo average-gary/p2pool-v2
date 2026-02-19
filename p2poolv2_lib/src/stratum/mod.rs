@@ -24,6 +24,6 @@ pub mod server;
 pub mod session;
 pub mod session_timeout;
 pub mod util;
-mod validate_username;
+pub mod validate_username;
 pub mod work;
 pub mod zmq_listener;

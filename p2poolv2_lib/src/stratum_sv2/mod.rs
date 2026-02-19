@@ -22,11 +22,13 @@
 //!
 //! # Module Structure
 //!
+//! - [`channels`] - Standard mining channel management (open, track, group)
 //! - [`connection`] - TCP listener, Noise NX handshake, per-connection read/write tasks
 //! - [`connections`] - Connection registry actor for tracking and broadcasting to SV2 clients
 //! - [`error`] - Error types for the SV2 subsystem
 //! - [`setup`] - SetupConnection message handler
 
+pub mod channels;
 pub mod connection;
 pub mod connections;
 pub mod error;
