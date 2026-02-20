@@ -28,6 +28,7 @@
 //! - [`error`] - Error types for the SV2 subsystem
 //! - [`job_distributor`] - Job distribution actor (template -> channels)
 //! - [`setup`] - SetupConnection message handler
+//! - [`shares`] - SubmitSharesStandard handler and Emission bridge
 //! - [`work`] - GBT block template to SV2 job conversion
 
 pub mod channels;
@@ -36,6 +37,7 @@ pub mod connections;
 pub mod error;
 pub mod job_distributor;
 pub mod setup;
+pub mod shares;
 pub mod work;
 
 #[cfg(test)]
