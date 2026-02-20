@@ -26,11 +26,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bitcoin::blockdata::block::Header;
 use bitcoin::hashes::Hash;
 use stratum_core::mining_sv2::{SubmitSharesError, SubmitSharesStandard, SubmitSharesSuccess};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::accounting::simple_pplns::SimplePplnsShare;
 use crate::stratum::emission::{Emission, EmissionSender};
-use crate::stratum::work::block_template::BlockTemplate;
 
 use super::channels::StandardChannel;
 use super::error::Sv2Error;

@@ -35,6 +35,7 @@ pub mod channels;
 pub mod connection;
 pub mod connections;
 pub mod error;
+pub mod handler;
 pub mod job_distributor;
 pub mod setup;
 pub mod shares;
