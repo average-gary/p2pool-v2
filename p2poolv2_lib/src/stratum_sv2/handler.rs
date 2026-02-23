@@ -28,18 +28,22 @@
 //!    connection registry
 //! 5. Cleans up channels and registry entries on disconnect
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use stratum_core::codec_sv2::{NoiseEncoder, StandardEitherFrame, StandardNoiseDecoder, State};
 use stratum_core::framing_sv2::framing::{Frame, Sv2Frame};
 use stratum_core::mining_sv2::{
-    NewMiningJob, OpenStandardMiningChannel, SetNewPrevHash, SubmitSharesStandard,
+    NewMiningJob, OpenStandardMiningChannel, SetNewPrevHash, SetTarget, SubmitSharesStandard,
 };
 use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, IsSv2Message, Mining};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
+
+use super::difficulty::difficulty_to_target;
+use crate::stratum::difficulty_adjuster::{DifficultyAdjuster, DifficultyAdjusterTrait};
 
 /// Type alias for the SV2 frame type returned by the Noise decoder.
 type Sv2DecodedFrame = StandardEitherFrame<AnyMessage<'static>>;
@@ -78,6 +82,12 @@ pub struct Sv2ConnectionContext {
     pub network: bitcoin::Network,
 }
 
+/// Default starting difficulty for SV2 channels.
+const SV2_START_DIFFICULTY: u64 = 1;
+
+/// Minimum difficulty for SV2 channels.
+const SV2_MINIMUM_DIFFICULTY: u64 = 1;
+
 /// Per-connection session state.
 struct Sv2Session {
     downstream_id: DownstreamId,
@@ -87,6 +97,8 @@ struct Sv2Session {
     /// Tracks accepted shares for SubmitSharesSuccess responses.
     accepted_shares: u32,
     shares_sum: u64,
+    /// Per-channel difficulty adjusters, keyed by channel_id.
+    difficulty_adjusters: HashMap<u32, DifficultyAdjuster>,
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +144,7 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
         group_channel_id: None,
         accepted_shares: 0,
         shares_sum: 0,
+        difficulty_adjusters: HashMap::new(),
     };
 
     // Spawn the writer task.
@@ -444,6 +457,14 @@ async fn handle_open_standard_channel(
         }
     }
 
+    // Initialize a difficulty adjuster for this channel.
+    let adjuster = DifficultyAdjuster::new(
+        SV2_START_DIFFICULTY,
+        SV2_MINIMUM_DIFFICULTY,
+        None, // no maximum difficulty cap
+    );
+    session.difficulty_adjusters.insert(channel_id, adjuster);
+
     info!(
         downstream_id = session.downstream_id,
         channel_id, group_channel_id, "SV2 standard mining channel opened"
@@ -496,6 +517,13 @@ async fn handle_submit_shares_standard(
         }
     };
 
+    // Get current channel difficulty for accounting.
+    let channel_difficulty = session
+        .difficulty_adjusters
+        .get(&channel_id)
+        .map(|adj| adj.get_current_difficulty())
+        .unwrap_or(SV2_START_DIFFICULTY);
+
     // Validate the share.
     match validate_share(&submit, &job_state, &channel) {
         Ok(validation) => {
@@ -506,13 +534,14 @@ async fn handle_submit_shares_standard(
                 return Ok(());
             }
 
-            // Emit to accounting pipeline.
+            // Emit to accounting pipeline with actual channel difficulty.
             if let Err(e) = emit_share(
                 &submit,
                 &validation,
                 &job_state,
                 &channel,
                 &ctx.emissions_tx,
+                channel_difficulty,
             )
             .await
             {
@@ -522,9 +551,46 @@ async fn handle_submit_shares_standard(
                 );
             }
 
+            // Record share in difficulty adjuster and check for retarget.
+            let new_difficulty =
+                if let Some(adjuster) = session.difficulty_adjusters.get_mut(&channel_id) {
+                    let (new_diff, _is_first) = adjuster.record_share_submission(
+                        channel_difficulty as u128,
+                        job_id as u64,
+                        None, // no suggested difficulty from client
+                        std::time::SystemTime::now(),
+                    );
+                    new_diff
+                } else {
+                    None
+                };
+
+            // If difficulty changed, update channel target and send SetTarget.
+            if let Some(new_diff) = new_difficulty {
+                let new_target = difficulty_to_target(new_diff);
+                let _ = ctx.channels.update_target(channel_id, new_target).await;
+
+                let set_target = SetTarget {
+                    channel_id,
+                    maximum_target: new_target
+                        .to_vec()
+                        .try_into()
+                        .expect("32 bytes is valid U256"),
+                };
+                let any = AnyMessage::Mining(Mining::SetTarget(set_target));
+                send_message(state, &ctx.connections, session.downstream_id, any).await?;
+
+                info!(
+                    downstream_id = session.downstream_id,
+                    channel_id,
+                    new_difficulty = new_diff,
+                    "SV2 difficulty adjusted, sent SetTarget"
+                );
+            }
+
             // Send success response.
             session.accepted_shares += 1;
-            session.shares_sum += 1; // placeholder difficulty
+            session.shares_sum += channel_difficulty;
             let success_resp = build_submit_success(
                 channel_id,
                 seq_num,

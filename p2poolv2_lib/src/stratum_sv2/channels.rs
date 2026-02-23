@@ -169,6 +169,12 @@ enum ChannelCmd {
         downstream_id: DownstreamId,
         reply: oneshot::Sender<Option<u32>>,
     },
+    /// Update the mining target for a specific channel.
+    UpdateTarget {
+        channel_id: u32,
+        new_target: [u8; 32],
+        reply: oneshot::Sender<bool>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +321,16 @@ impl Sv2ChannelManager {
             .map(|g| g.group_channel_id)
     }
 
+    fn handle_update_target(&mut self, channel_id: u32, new_target: [u8; 32]) -> bool {
+        if let Some(channel) = self.channels.get_mut(&channel_id) {
+            channel.target = new_target;
+            debug!(channel_id, "updated channel target");
+            true
+        } else {
+            false
+        }
+    }
+
     /// Run the actor event loop.
     async fn run(mut self, mut cmd_rx: mpsc::Receiver<ChannelCmd>) {
         while let Some(cmd) = cmd_rx.recv().await {
@@ -351,6 +367,13 @@ impl Sv2ChannelManager {
                     reply,
                 } => {
                     let _ = reply.send(self.handle_get_group_channel_id(downstream_id));
+                }
+                ChannelCmd::UpdateTarget {
+                    channel_id,
+                    new_target,
+                    reply,
+                } => {
+                    let _ = reply.send(self.handle_update_target(channel_id, new_target));
                 }
             }
         }
@@ -470,6 +493,31 @@ impl Sv2ChannelHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.cmd_tx
             .send(ChannelCmd::GetCount { reply: reply_tx })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager actor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager reply dropped".to_string()))
+    }
+
+    /// Update the mining target for a specific channel.
+    ///
+    /// Called by the per-connection handler when the difficulty adjuster
+    /// determines a new target. Returns `true` if the channel was found
+    /// and updated, `false` if the channel ID is unknown.
+    pub async fn update_target(
+        &self,
+        channel_id: u32,
+        new_target: [u8; 32],
+    ) -> Result<bool, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCmd::UpdateTarget {
+                channel_id,
+                new_target,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| Sv2Error::ChannelError("channel manager actor stopped".to_string()))?;
 

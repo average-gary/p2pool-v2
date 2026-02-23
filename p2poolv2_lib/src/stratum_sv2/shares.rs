@@ -135,12 +135,17 @@ fn hash_le_target(hash: &[u8], target: &[u8; 32]) -> bool {
 /// This produces an `Emission` struct identical to what SV1 produces,
 /// so all downstream accounting (PPLNS, share chain, block submission)
 /// works unchanged.
+///
+/// # Arguments
+///
+/// * `difficulty` - The current channel difficulty, used for PPLNS weighting.
 pub async fn emit_share(
     submit: &SubmitSharesStandard,
     validation: &ShareValidationResult,
     job_state: &Sv2JobState,
     channel: &StandardChannel,
     emissions_tx: &EmissionSender,
+    difficulty: u64,
 ) -> Result<(), Sv2Error> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -152,7 +157,7 @@ pub async fn emit_share(
     // so we store the channel's extranonce prefix as the "extranonce2" equivalent.
     let pplns = SimplePplnsShare::new(
         channel.user_id,
-        1, // difficulty placeholder — will be refined with vardiff (issue #9)
+        difficulty,
         channel.btc_address.clone(),
         channel.worker_name.clone().unwrap_or_default(),
         timestamp,
@@ -376,7 +381,7 @@ mod tests {
         let validation = validate_share(&submit, &job_state, &channel).unwrap();
 
         let (emissions_tx, mut emissions_rx) = tokio::sync::mpsc::channel(10);
-        let result = emit_share(&submit, &validation, &job_state, &channel, &emissions_tx).await;
+        let result = emit_share(&submit, &validation, &job_state, &channel, &emissions_tx, 1).await;
         assert!(result.is_ok());
 
         let emission = emissions_rx.recv().await.unwrap();
