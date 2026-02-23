@@ -39,6 +39,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+#[cfg(feature = "sv2")]
+use crate::stratum_sv2::job_distributor::Sv2JobDistributorHandle;
+
 #[cfg(not(test))]
 use crate::stratum::client_connections::ClientConnectionsHandle;
 #[cfg(test)]
@@ -194,8 +197,23 @@ pub enum NotifyCmd {
     },
 }
 
+/// Opaque handle for the SV2 job distributor, passed through
+/// to `start_notify` so that new templates are forwarded to SV2 miners.
+///
+/// When the `sv2` feature is disabled this is a unit type and carries no data.
+#[cfg(feature = "sv2")]
+pub type Sv2NotifyBridge = Option<Sv2JobDistributorHandle>;
+/// Stub type when SV2 is not compiled in.
+#[cfg(not(feature = "sv2"))]
+pub type Sv2NotifyBridge = ();
+
 /// Start a task that listens for new block template events.
 /// As new templates arrives, the tasks build new Notify messages and sends them to all connected clients.
+///
+/// When `sv2_bridge` is `Some(handle)` (only available with the `sv2` feature),
+/// each new template is also forwarded to the SV2 job distributor so that SV2
+/// miners receive `NewMiningJob` / `SetNewPrevHash` messages via the same GBT
+/// pipeline.
 pub async fn start_notify(
     mut notifier_rx: mpsc::Receiver<NotifyCmd>,
     connections: ClientConnectionsHandle,
@@ -203,7 +221,12 @@ pub async fn start_notify(
     tracker_handle: Arc<JobTracker>,
     config: &StratumConfig<crate::config::Parsed>,
     miner_pubkey: Option<CompressedPublicKey>,
+    sv2_bridge: Sv2NotifyBridge,
 ) {
+    // Suppress unused warning when sv2 feature is off.
+    #[cfg(not(feature = "sv2"))]
+    let _ = &sv2_bridge;
+
     let mut latest_template: Option<Arc<BlockTemplate>> = None;
     let pool_signature = match config.pool_signature {
         Some(ref sig) => sig.as_bytes(),
@@ -234,6 +257,31 @@ pub async fn start_notify(
                         continue;
                     }
                 };
+
+                // Forward template to SV2 job distributor (if enabled).
+                // We recompute output_distribution and commitment_hash from
+                // the same template the SV1 path just used, so both protocols
+                // distribute identical coinbase payouts.
+                #[cfg(feature = "sv2")]
+                if let Some(ref sv2_dist) = sv2_bridge {
+                    let sv2_output_distribution =
+                        build_output_distribution(&template, &chain_store_handle, config).await;
+                    let sv2_commitment_hash = _share_commitment
+                        .as_ref()
+                        .map(|commitment| commitment.hash());
+                    if let Err(e) = sv2_dist
+                        .new_template(
+                            Arc::clone(&template),
+                            sv2_output_distribution,
+                            pool_signature.to_vec(),
+                            sv2_commitment_hash,
+                            _share_commitment.clone(),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to forward template to SV2 distributor: {e}");
+                    }
+                }
 
                 connections.send_to_all(Arc::new(notify_str.clone())).await;
                 if chain_store_handle.add_job(notify_str).await.is_err() {
@@ -444,6 +492,10 @@ mod tests {
                 .unwrap();
 
         let task_handle = tokio::spawn(async move {
+            #[cfg(feature = "sv2")]
+            let sv2_bridge: Sv2NotifyBridge = None;
+            #[cfg(not(feature = "sv2"))]
+            let sv2_bridge: Sv2NotifyBridge = ();
             start_notify(
                 notify_rx,
                 mock_connections,
@@ -451,6 +503,7 @@ mod tests {
                 work_map_handle,
                 &stratum_config,
                 Some(miner_pubkey),
+                sv2_bridge,
             )
             .await;
         });

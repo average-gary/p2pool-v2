@@ -48,6 +48,7 @@ use stratum_core::binary_sv2::{Sv2Option, U256};
 use stratum_core::mining_sv2::{NewMiningJob, SetNewPrevHash};
 use tracing::debug;
 
+use crate::shares::share_commitment::ShareCommitment;
 use crate::stratum::work::block_template::BlockTemplate;
 use crate::stratum::work::coinbase::build_coinbase_transaction;
 use crate::stratum::work::notify::parse_flags;
@@ -97,6 +98,8 @@ pub struct Sv2JobState {
     pub nbits: u32,
     /// curtime from the template.
     pub min_ntime: u32,
+    /// Share commitment for the sharechain (if available).
+    pub share_commitment: Option<ShareCommitment>,
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +114,9 @@ pub struct Sv2JobParams {
     pub pool_signature: Vec<u8>,
     /// Optional share commitment hash for the coinbase script_sig.
     pub commitment_hash: Option<bitcoin::hashes::sha256::Hash>,
+    /// Full share commitment struct (if available), stored in job state
+    /// so that SV2 shares emitted to the accounting pipeline include it.
+    pub share_commitment: Option<ShareCommitment>,
     /// Whether this is a future job (new template, same prevhash not yet received).
     pub is_future: bool,
 }
@@ -237,6 +243,7 @@ pub fn build_new_mining_job(
         },
         nbits,
         min_ntime: template.curtime,
+        share_commitment: params.share_commitment.clone(),
     };
 
     debug!(
@@ -344,6 +351,7 @@ mod tests {
             output_distribution: test_output_distribution(),
             pool_signature: b"P2Pool".to_vec(),
             commitment_hash: None,
+            share_commitment: None,
             is_future: false,
         };
 
@@ -370,6 +378,7 @@ mod tests {
             output_distribution: test_output_distribution(),
             pool_signature: b"P2Pool".to_vec(),
             commitment_hash: None,
+            share_commitment: None,
             is_future: true,
         };
 
@@ -390,6 +399,7 @@ mod tests {
             output_distribution: test_output_distribution(),
             pool_signature: b"P2Pool".to_vec(),
             commitment_hash: None,
+            share_commitment: None,
             is_future: false,
         };
 
@@ -439,6 +449,7 @@ mod tests {
             output_distribution: test_output_distribution(),
             pool_signature: b"P2Pool".to_vec(),
             commitment_hash: None,
+            share_commitment: None,
             is_future: false,
         };
 

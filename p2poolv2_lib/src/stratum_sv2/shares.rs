@@ -166,7 +166,7 @@ pub async fn emit_share(
         header: validation.header,
         coinbase: job_state.coinbase.clone(),
         blocktemplate: Arc::clone(&job_state.template),
-        share_commitment: None, // TODO: wire share commitment from job state
+        share_commitment: job_state.share_commitment.clone(),
     };
 
     emissions_tx
@@ -285,6 +285,7 @@ mod tests {
             prev_hash: Some(prev_hash),
             nbits: 0x1d00ffff,
             min_ntime: 1700000100,
+            share_commitment: None,
         }
     }
 

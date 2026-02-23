@@ -34,6 +34,7 @@
 pub mod channels;
 pub mod connection;
 pub mod connections;
+pub mod difficulty;
 pub mod error;
 pub mod handler;
 pub mod job_distributor;

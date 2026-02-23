@@ -46,6 +46,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, info, warn};
 
 use crate::accounting::OutputPair;
+use crate::shares::share_commitment::ShareCommitment;
 use crate::stratum::work::block_template::BlockTemplate;
 
 use super::error::Sv2Error;
@@ -63,6 +64,7 @@ pub enum JobDistributorCmd {
         output_distribution: Vec<OutputPair>,
         pool_signature: Vec<u8>,
         commitment_hash: Option<bitcoin::hashes::sha256::Hash>,
+        share_commitment: Option<ShareCommitment>,
     },
     /// Get the current active job state for a group (used to bootstrap new channels).
     GetActiveJob {
@@ -132,6 +134,7 @@ struct CachedJobParams {
     output_distribution: Vec<OutputPair>,
     pool_signature: Vec<u8>,
     commitment_hash: Option<bitcoin::hashes::sha256::Hash>,
+    share_commitment: Option<ShareCommitment>,
 }
 
 /// Internal actor state for the job distributor.
@@ -192,6 +195,7 @@ impl Sv2JobDistributor {
         output_distribution: Vec<OutputPair>,
         pool_signature: Vec<u8>,
         commitment_hash: Option<bitcoin::hashes::sha256::Hash>,
+        share_commitment: Option<ShareCommitment>,
     ) {
         let clean_jobs = self
             .last_prev_hash
@@ -218,6 +222,7 @@ impl Sv2JobDistributor {
             output_distribution: output_distribution.clone(),
             pool_signature: pool_signature.clone(),
             commitment_hash,
+            share_commitment: share_commitment.clone(),
         });
 
         // Build a job for each registered group
@@ -232,6 +237,7 @@ impl Sv2JobDistributor {
                 output_distribution: output_distribution.clone(),
                 pool_signature: pool_signature.clone(),
                 commitment_hash,
+                share_commitment: share_commitment.clone(),
                 is_future: false, // For now, always send immediately-minable jobs
             };
 
@@ -286,6 +292,7 @@ impl Sv2JobDistributor {
                 output_distribution: cached.output_distribution,
                 pool_signature: cached.pool_signature,
                 commitment_hash: cached.commitment_hash,
+                share_commitment: cached.share_commitment,
                 is_future: false,
             };
 
@@ -352,12 +359,14 @@ impl Sv2JobDistributor {
                     output_distribution,
                     pool_signature,
                     commitment_hash,
+                    share_commitment,
                 } => {
                     self.handle_new_template(
                         template,
                         output_distribution,
                         pool_signature,
                         commitment_hash,
+                        share_commitment,
                     );
                 }
                 JobDistributorCmd::GetActiveJob {
@@ -416,6 +425,7 @@ impl Sv2JobDistributorHandle {
         output_distribution: Vec<OutputPair>,
         pool_signature: Vec<u8>,
         commitment_hash: Option<bitcoin::hashes::sha256::Hash>,
+        share_commitment: Option<ShareCommitment>,
     ) -> Result<(), Sv2Error> {
         self.cmd_tx
             .send(JobDistributorCmd::NewTemplate {
@@ -423,6 +433,7 @@ impl Sv2JobDistributorHandle {
                 output_distribution,
                 pool_signature,
                 commitment_hash,
+                share_commitment,
             })
             .await
             .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))
@@ -578,6 +589,7 @@ mod tests {
                 test_output_distribution(),
                 b"P2Pool".to_vec(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -612,6 +624,7 @@ mod tests {
                 test_output_distribution(),
                 b"P2Pool".to_vec(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -641,6 +654,7 @@ mod tests {
                 test_output_distribution(),
                 b"P2Pool".to_vec(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -666,7 +680,13 @@ mod tests {
             850000,
         ));
         handle
-            .new_template(t1, test_output_distribution(), b"P2Pool".to_vec(), None)
+            .new_template(
+                t1,
+                test_output_distribution(),
+                b"P2Pool".to_vec(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -681,7 +701,13 @@ mod tests {
             850000,
         ));
         handle
-            .new_template(t2, test_output_distribution(), b"P2Pool".to_vec(), None)
+            .new_template(
+                t2,
+                test_output_distribution(),
+                b"P2Pool".to_vec(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -695,7 +721,13 @@ mod tests {
             850001,
         ));
         handle
-            .new_template(t3, test_output_distribution(), b"P2Pool".to_vec(), None)
+            .new_template(
+                t3,
+                test_output_distribution(),
+                b"P2Pool".to_vec(),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -718,6 +750,7 @@ mod tests {
                 template,
                 test_output_distribution(),
                 b"P2Pool".to_vec(),
+                None,
                 None,
             )
             .await
