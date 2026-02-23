@@ -13,7 +13,7 @@ categories.workspace = true
 rust-version.workspace = true
 
 [dev-dependencies]
-p2poolv2_lib = { workspace = true, features = ["test-utils"] }
+p2poolv2_lib = { workspace = true, features = ["test-utils", "sv2"] }
 p2poolv2_api = { workspace = true }
 mockall.workspace = true
 mockall_double.workspace = true
@@ -41,3 +41,5 @@ libp2p = { workspace = true, features = [
 reqwest = { workspace = true, features = ["json", "blocking"] }
 bitcoindrpc = { workspace = true, features = ["test-utils"] }
 chrono.workspace = true
+stratum-core = { workspace = true }
+hex = { workspace = true }
