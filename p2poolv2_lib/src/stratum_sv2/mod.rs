@@ -22,14 +22,14 @@
 //!
 //! # Module Structure
 //!
-//! - [`channels`] - Standard mining channel management (open, track, group)
+//! - [`channels`] - Standard + extended mining channel management (open, track, group)
 //! - [`connection`] - TCP listener, Noise NX handshake, per-connection read/write tasks
 //! - [`connections`] - Connection registry actor for tracking and broadcasting to SV2 clients
 //! - [`error`] - Error types for the SV2 subsystem
-//! - [`job_distributor`] - Job distribution actor (template -> channels)
+//! - [`job_distributor`] - Job distribution actor (template -> channels, standard + extended)
 //! - [`setup`] - SetupConnection message handler
-//! - [`shares`] - SubmitSharesStandard handler and Emission bridge
-//! - [`work`] - GBT block template to SV2 job conversion
+//! - [`shares`] - SubmitSharesStandard/Extended handler and Emission bridge
+//! - [`work`] - GBT block template to SV2 job conversion (NewMiningJob + NewExtendedMiningJob)
 
 pub mod channels;
 pub mod connection;

@@ -25,15 +25,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::blockdata::block::Header;
 use bitcoin::hashes::Hash;
-use stratum_core::mining_sv2::{SubmitSharesError, SubmitSharesStandard, SubmitSharesSuccess};
-use tracing::{debug, info};
+use stratum_core::mining_sv2::{
+    SubmitSharesError, SubmitSharesExtended, SubmitSharesStandard, SubmitSharesSuccess,
+};
+use tracing::{debug, info, warn};
 
 use crate::accounting::simple_pplns::SimplePplnsShare;
 use crate::stratum::emission::{Emission, EmissionSender};
 
-use super::channels::StandardChannel;
+use super::channels::{ExtendedChannel, StandardChannel, TOTAL_EXTRANONCE_SIZE};
 use super::error::Sv2Error;
-use super::work::Sv2JobState;
+use super::work::{Sv2ExtendedJobState, Sv2JobState, reconstruct_merkle_root};
 
 /// Result of validating a submitted share.
 #[derive(Debug)]
@@ -184,6 +186,177 @@ pub async fn emit_share(
         job_id = submit.job_id,
         user_id = channel.user_id,
         "emitted SV2 share to accounting pipeline"
+    );
+
+    Ok(())
+}
+
+/// Validate a `SubmitSharesExtended` against the stored extended job state.
+///
+/// Extended channel share validation differs from standard:
+/// 1. The proxy provides its own `extranonce` (must match the negotiated size)
+/// 2. The full coinbase is reconstructed: `prefix + extranonce_prefix + proxy_extranonce + suffix`
+/// 3. The merkle root is computed by walking the merkle path from the coinbase txid
+/// 4. The block header is built and PoW is checked
+pub fn validate_extended_share(
+    submit: &SubmitSharesExtended<'_>,
+    job_state: &Sv2ExtendedJobState,
+    channel: &ExtendedChannel,
+) -> Result<ShareValidationResult, Sv2Error> {
+    // The prev_hash must be set (job must be activated, not future)
+    let prev_hash_bytes = job_state.prev_hash.ok_or_else(|| {
+        Sv2Error::InvalidMessage("share submitted against a future (unactivated) job".to_string())
+    })?;
+
+    // Validate extranonce size
+    let submitted_extranonce: &[u8] = submit.extranonce.inner_as_ref();
+    if submitted_extranonce.len() != channel.extranonce_size as usize {
+        return Err(Sv2Error::InvalidMessage(format!(
+            "extranonce size mismatch: expected {}, got {}",
+            channel.extranonce_size,
+            submitted_extranonce.len()
+        )));
+    }
+
+    // Validate that extranonce_prefix + proxy_extranonce = TOTAL_EXTRANONCE_SIZE
+    let total = channel.extranonce_prefix.len() + submitted_extranonce.len();
+    if total != TOTAL_EXTRANONCE_SIZE {
+        return Err(Sv2Error::InvalidMessage(format!(
+            "total extranonce size mismatch: prefix({}) + extranonce({}) = {} != {}",
+            channel.extranonce_prefix.len(),
+            submitted_extranonce.len(),
+            total,
+            TOTAL_EXTRANONCE_SIZE,
+        )));
+    }
+
+    // Reconstruct the full coinbase transaction
+    let mut coinbase_bytes = job_state.coinbase_tx_prefix.clone();
+    coinbase_bytes.extend_from_slice(&channel.extranonce_prefix);
+    coinbase_bytes.extend_from_slice(submitted_extranonce);
+    coinbase_bytes.extend_from_slice(&job_state.coinbase_tx_suffix);
+
+    let coinbase: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&coinbase_bytes).map_err(|e| {
+            Sv2Error::InvalidMessage(format!("failed to deserialize reconstructed coinbase: {e}"))
+        })?;
+
+    // Compute the coinbase txid and walk the merkle path to get the root
+    let coinbase_txid = coinbase.compute_txid();
+    let txid_bytes: [u8; 32] = *coinbase_txid.as_ref();
+    let merkle_root_bytes = reconstruct_merkle_root(&txid_bytes, &job_state.merkle_path);
+
+    let prev_blockhash = bitcoin::BlockHash::from_byte_array(prev_hash_bytes);
+    let merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle_root_bytes);
+    let compact_target = bitcoin::CompactTarget::from_consensus(job_state.nbits);
+
+    let header = Header {
+        version: bitcoin::block::Version::from_consensus(submit.version as i32),
+        prev_blockhash,
+        merkle_root,
+        time: submit.ntime,
+        bits: compact_target,
+        nonce: submit.nonce,
+    };
+
+    // Check against Bitcoin network target
+    let network_target = bitcoin::Target::from_compact(compact_target);
+    let meets_network_difficulty = header.validate_pow(network_target).is_ok();
+
+    if meets_network_difficulty {
+        info!(
+            channel_id = submit.channel_id,
+            job_id = submit.job_id,
+            block_hash = %header.block_hash(),
+            "extended share meets Bitcoin network difficulty!"
+        );
+    }
+
+    // Check against channel target
+    let block_hash = header.block_hash();
+    let hash_bytes = block_hash.as_ref();
+    let meets_channel_target = hash_le_target(hash_bytes, &channel.target);
+
+    debug!(
+        channel_id = submit.channel_id,
+        job_id = submit.job_id,
+        nonce = submit.nonce,
+        meets_network = meets_network_difficulty,
+        meets_channel = meets_channel_target,
+        "validated SV2 extended share"
+    );
+
+    Ok(ShareValidationResult {
+        header,
+        meets_network_difficulty,
+        meets_channel_target,
+    })
+}
+
+/// Convert a validated SV2 extended share into an [`Emission`] and send it
+/// through the shared emissions pipeline.
+pub async fn emit_extended_share(
+    submit: &SubmitSharesExtended<'_>,
+    validation: &ShareValidationResult,
+    job_state: &Sv2ExtendedJobState,
+    channel: &ExtendedChannel,
+    emissions_tx: &EmissionSender,
+    difficulty: u64,
+) -> Result<(), Sv2Error> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Reconstruct coinbase for the emission
+    let submitted_extranonce: &[u8] = submit.extranonce.inner_as_ref();
+    let mut coinbase_bytes = job_state.coinbase_tx_prefix.clone();
+    coinbase_bytes.extend_from_slice(&channel.extranonce_prefix);
+    coinbase_bytes.extend_from_slice(submitted_extranonce);
+    coinbase_bytes.extend_from_slice(&job_state.coinbase_tx_suffix);
+
+    let coinbase: bitcoin::Transaction =
+        bitcoin::consensus::deserialize(&coinbase_bytes).map_err(|e| {
+            Sv2Error::InvalidMessage(format!("failed to deserialize coinbase for emission: {e}"))
+        })?;
+
+    // For extended channels, the extranonce is the full concatenation of
+    // pool prefix + proxy extranonce
+    let full_extranonce = {
+        let mut v = channel.extranonce_prefix.clone();
+        v.extend_from_slice(submitted_extranonce);
+        v
+    };
+
+    let pplns = SimplePplnsShare::new(
+        channel.user_id,
+        difficulty,
+        channel.btc_address.clone(),
+        channel.worker_name.clone().unwrap_or_default(),
+        timestamp,
+        format!("{:08x}", submit.job_id),
+        hex::encode(&full_extranonce),
+        format!("{:08x}", submit.nonce),
+    );
+
+    let emission = Emission {
+        pplns,
+        header: validation.header,
+        coinbase,
+        blocktemplate: Arc::clone(&job_state.template),
+        share_commitment: job_state.share_commitment.clone(),
+    };
+
+    emissions_tx
+        .send(emission)
+        .await
+        .map_err(|_| Sv2Error::ChannelError("emissions pipeline closed".to_string()))?;
+
+    debug!(
+        channel_id = submit.channel_id,
+        job_id = submit.job_id,
+        user_id = channel.user_id,
+        "emitted SV2 extended share to accounting pipeline"
     );
 
     Ok(())
@@ -363,6 +536,159 @@ mod tests {
         let msg = build_submit_error(1, 3, "stale-share");
         assert_eq!(msg.channel_id, 1);
         assert_eq!(msg.sequence_number, 3);
+    }
+
+    fn test_extended_channel() -> ExtendedChannel {
+        ExtendedChannel {
+            channel_id: 10,
+            downstream_id: 200,
+            btc_address: "tb1qproxy".to_string(),
+            worker_name: Some("proxy1".to_string()),
+            user_id: 99,
+            nominal_hash_rate: 10_000_000.0,
+            extranonce_prefix: vec![0x00; 6],
+            extranonce_size: 6,
+            target: [0xff; 32], // easiest possible target
+        }
+    }
+
+    fn test_extended_job_state() -> Sv2ExtendedJobState {
+        use crate::accounting::OutputPair;
+        use crate::stratum_sv2::work::{Sv2JobParams, build_new_extended_mining_job};
+        use std::str::FromStr;
+
+        let template = Arc::new(test_template());
+        let params = Sv2JobParams {
+            output_distribution: vec![OutputPair {
+                address: bitcoin::Address::from_str("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")
+                    .unwrap()
+                    .assume_checked(),
+                amount: bitcoin::Amount::from_sat(625_000_000),
+            }],
+            pool_signature: b"P2Pool".to_vec(),
+            commitment_hash: None,
+            share_commitment: None,
+            is_future: false,
+        };
+
+        let (_, state) = build_new_extended_mining_job(&template, 10, &params).unwrap();
+        state
+    }
+
+    #[test]
+    fn test_validate_extended_share_basic() {
+        let channel = test_extended_channel();
+        let job_state = test_extended_job_state();
+        let proxy_extranonce: Vec<u8> = vec![0xAA; 6]; // 6 bytes for proxy
+
+        use stratum_core::binary_sv2::B032;
+        let extranonce_b032: B032<'static> = proxy_extranonce.try_into().unwrap();
+
+        let submit = SubmitSharesExtended {
+            channel_id: 10,
+            sequence_number: 0,
+            job_id: job_state.job_id,
+            nonce: 0x12345678,
+            ntime: 1700000100,
+            version: 0x20000000,
+            extranonce: extranonce_b032,
+        };
+
+        let result = validate_extended_share(&submit, &job_state, &channel);
+        assert!(
+            result.is_ok(),
+            "validate_extended_share failed: {:?}",
+            result.err()
+        );
+        let result = result.unwrap();
+        // With an all-0xff target, any hash should meet the channel target
+        assert!(result.meets_channel_target);
+    }
+
+    #[test]
+    fn test_validate_extended_share_rejects_wrong_extranonce_size() {
+        let channel = test_extended_channel();
+        let job_state = test_extended_job_state();
+
+        // Wrong size: 4 bytes instead of 6
+        let proxy_extranonce: Vec<u8> = vec![0xAA; 4];
+        use stratum_core::binary_sv2::B032;
+        let extranonce_b032: B032<'static> = proxy_extranonce.try_into().unwrap();
+
+        let submit = SubmitSharesExtended {
+            channel_id: 10,
+            sequence_number: 0,
+            job_id: job_state.job_id,
+            nonce: 0,
+            ntime: 1700000100,
+            version: 0x20000000,
+            extranonce: extranonce_b032,
+        };
+
+        let result = validate_extended_share(&submit, &job_state, &channel);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("extranonce size mismatch"),
+        );
+    }
+
+    #[test]
+    fn test_validate_extended_share_rejects_future_job() {
+        let channel = test_extended_channel();
+        let mut job_state = test_extended_job_state();
+        job_state.prev_hash = None; // Future job
+
+        let proxy_extranonce: Vec<u8> = vec![0xAA; 6];
+        use stratum_core::binary_sv2::B032;
+        let extranonce_b032: B032<'static> = proxy_extranonce.try_into().unwrap();
+
+        let submit = SubmitSharesExtended {
+            channel_id: 10,
+            sequence_number: 0,
+            job_id: job_state.job_id,
+            nonce: 0,
+            ntime: 1700000100,
+            version: 0x20000000,
+            extranonce: extranonce_b032,
+        };
+
+        let result = validate_extended_share(&submit, &job_state, &channel);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_emit_extended_share() {
+        let channel = test_extended_channel();
+        let job_state = test_extended_job_state();
+        let proxy_extranonce: Vec<u8> = vec![0xAA; 6];
+        use stratum_core::binary_sv2::B032;
+        let extranonce_b032: B032<'static> = proxy_extranonce.try_into().unwrap();
+
+        let submit = SubmitSharesExtended {
+            channel_id: 10,
+            sequence_number: 0,
+            job_id: job_state.job_id,
+            nonce: 0x12345678,
+            ntime: 1700000100,
+            version: 0x20000000,
+            extranonce: extranonce_b032,
+        };
+
+        let validation = validate_extended_share(&submit, &job_state, &channel).unwrap();
+
+        let (emissions_tx, mut emissions_rx) = tokio::sync::mpsc::channel(10);
+        let result =
+            emit_extended_share(&submit, &validation, &job_state, &channel, &emissions_tx, 1).await;
+        assert!(result.is_ok());
+
+        let emission = emissions_rx.recv().await.unwrap();
+        assert_eq!(emission.pplns.user_id, 99);
+        assert_eq!(emission.pplns.btcaddress, Some("tb1qproxy".to_string()));
+        assert_eq!(emission.pplns.workername, Some("proxy1".to_string()));
+        assert_eq!(emission.header.nonce, 0x12345678);
     }
 
     #[tokio::test]

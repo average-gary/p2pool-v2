@@ -34,7 +34,8 @@ use std::sync::Arc;
 use stratum_core::codec_sv2::{NoiseEncoder, StandardEitherFrame, StandardNoiseDecoder, State};
 use stratum_core::framing_sv2::framing::{Frame, Sv2Frame};
 use stratum_core::mining_sv2::{
-    NewMiningJob, OpenStandardMiningChannel, SetNewPrevHash, SetTarget, SubmitSharesStandard,
+    NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannel, OpenStandardMiningChannel,
+    SetNewPrevHash, SetTarget, SubmitSharesExtended, SubmitSharesStandard,
 };
 use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, IsSv2Message, Mining};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -59,8 +60,11 @@ use super::job_distributor::{JobEvent, Sv2JobDistributorHandle};
 use super::setup::{
     build_setup_connection_error, build_setup_connection_success, validate_setup_connection,
 };
-use super::shares::{build_submit_error, build_submit_success, emit_share, validate_share};
-// work module types used by job_distributor lookups
+use super::shares::{
+    build_submit_error, build_submit_success, emit_extended_share, emit_share,
+    validate_extended_share, validate_share,
+};
+use super::work::Sv2ExtendedJobState;
 
 /// Timeout for the initial SetupConnection message (seconds).
 const SETUP_CONNECTION_TIMEOUT_SECS: u64 = 30;
@@ -94,6 +98,8 @@ struct Sv2Session {
     setup_complete: bool,
     /// Group channel ID (set after first OpenStandardMiningChannel).
     group_channel_id: Option<u32>,
+    /// Extended channel IDs opened on this connection.
+    extended_channel_ids: Vec<u32>,
     /// Tracks accepted shares for SubmitSharesSuccess responses.
     accepted_shares: u32,
     shares_sum: u64,
@@ -138,10 +144,15 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
     // Subscribe to job events for pushing NewMiningJob/SetNewPrevHash.
     let job_events = ctx.job_distributor.subscribe_job_events();
 
+    // Shared extended channel ID list between reader and writer tasks.
+    let shared_ext_channel_ids: Arc<tokio::sync::Mutex<Vec<u32>>> =
+        Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
     let mut session = Sv2Session {
         downstream_id,
         setup_complete: false,
         group_channel_id: None,
+        extended_channel_ids: Vec::new(),
         accepted_shares: 0,
         shares_sum: 0,
         difficulty_adjusters: HashMap::new(),
@@ -150,6 +161,7 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
     // Spawn the writer task.
     let writer_state = Arc::clone(&state);
     let _writer_connections = ctx.connections.clone();
+    let writer_ext_ids = Arc::clone(&shared_ext_channel_ids);
     let writer_handle = tokio::spawn(writer_task(
         write_half,
         writer_state,
@@ -157,10 +169,18 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
         shutdown_rx,
         job_events,
         downstream_id,
+        writer_ext_ids,
     ));
 
     // Run the reader loop.
-    let result = reader_loop(read_half, &state, &mut session, &ctx).await;
+    let result = reader_loop(
+        read_half,
+        &state,
+        &mut session,
+        &ctx,
+        &shared_ext_channel_ids,
+    )
+    .await;
 
     if let Err(e) = &result {
         match e {
@@ -181,6 +201,12 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
     let _ = ctx.channels.remove_downstream(downstream_id).await;
     if let Some(group_id) = session.group_channel_id {
         let _ = ctx.job_distributor.unregister_group(group_id).await;
+    }
+    for ext_ch_id in &session.extended_channel_ids {
+        let _ = ctx
+            .job_distributor
+            .unregister_extended_channel(*ext_ch_id)
+            .await;
     }
 
     // The writer task will exit when shutdown_rx fires (triggered by
@@ -204,6 +230,7 @@ async fn reader_loop(
     state: &Arc<tokio::sync::Mutex<State>>,
     session: &mut Sv2Session,
     ctx: &Sv2ConnectionContext,
+    shared_ext_channel_ids: &Arc<tokio::sync::Mutex<Vec<u32>>>,
 ) -> Result<(), Sv2Error> {
     // Phase 1: Read SetupConnection.
     let setup_result = tokio::time::timeout(
@@ -270,8 +297,21 @@ async fn reader_loop(
             AnyMessage::Mining(Mining::OpenStandardMiningChannel(msg)) => {
                 handle_open_standard_channel(msg.into_static(), session, ctx, state).await?;
             }
+            AnyMessage::Mining(Mining::OpenExtendedMiningChannel(msg)) => {
+                handle_open_extended_channel(
+                    msg.into_static(),
+                    session,
+                    ctx,
+                    state,
+                    shared_ext_channel_ids,
+                )
+                .await?;
+            }
             AnyMessage::Mining(Mining::SubmitSharesStandard(msg)) => {
                 handle_submit_shares_standard(msg, session, ctx, state).await?;
+            }
+            AnyMessage::Mining(Mining::SubmitSharesExtended(msg)) => {
+                handle_submit_shares_extended(msg.into_static(), session, ctx, state).await?;
             }
             _ => {
                 warn!(
@@ -476,6 +516,163 @@ async fn handle_open_standard_channel(
 }
 
 // ---------------------------------------------------------------------------
+// OpenExtendedMiningChannel handler
+// ---------------------------------------------------------------------------
+
+async fn handle_open_extended_channel(
+    msg: OpenExtendedMiningChannel<'static>,
+    session: &mut Sv2Session,
+    ctx: &Sv2ConnectionContext,
+    state: &Arc<tokio::sync::Mutex<State>>,
+    shared_ext_channel_ids: &Arc<tokio::sync::Mutex<Vec<u32>>>,
+) -> Result<(), Sv2Error> {
+    let request_id = msg.request_id;
+
+    // Validate and register user (same flow as standard channels).
+    let user_result = validate_and_register_user(
+        &msg.user_identity,
+        ctx.validate_addresses,
+        ctx.network,
+        &ctx.chain_store,
+    )
+    .await;
+
+    let (btc_address, worker_name, user_id) = match user_result {
+        Ok(v) => v,
+        Err(e) => {
+            let err_resp = build_open_channel_error(request_id, &e.to_string());
+            let any = AnyMessage::Mining(Mining::OpenMiningChannelError(err_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+            warn!(
+                downstream_id = session.downstream_id,
+                "OpenExtendedMiningChannel rejected: {e}"
+            );
+            return Ok(());
+        }
+    };
+
+    // Open the extended channel.
+    let open_result = ctx
+        .channels
+        .open_extended_channel(
+            session.downstream_id,
+            msg,
+            btc_address,
+            worker_name,
+            user_id,
+        )
+        .await;
+
+    let success = match open_result {
+        Ok(s) => s,
+        Err(e) => {
+            let err_resp = build_open_channel_error(request_id, &e.to_string());
+            let any = AnyMessage::Mining(Mining::OpenMiningChannelError(err_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+            return Ok(());
+        }
+    };
+
+    let channel_id = success.channel.channel_id;
+    let extranonce_prefix = success.channel.extranonce_prefix.clone();
+
+    // Send OpenExtendedMiningChannelSuccess.
+    let any = AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(success.response));
+    send_message(state, &ctx.connections, session.downstream_id, any).await?;
+
+    // Register the extended channel with the job distributor.
+    ctx.job_distributor
+        .register_extended_channel(channel_id, extranonce_prefix)
+        .await?;
+    session.extended_channel_ids.push(channel_id);
+
+    // Update the shared list so the writer task knows about this channel.
+    shared_ext_channel_ids.lock().await.push(channel_id);
+
+    // Bootstrap: send the current active extended job.
+    if let Ok(Some(active)) = ctx
+        .job_distributor
+        .get_active_extended_job(channel_id)
+        .await
+    {
+        // Send SetNewPrevHash first if the job is activated.
+        if let Some(prev_hash) = active.job_state.prev_hash {
+            let prev_hash_msg = SetNewPrevHash {
+                channel_id,
+                job_id: active.job_id,
+                prev_hash: prev_hash
+                    .to_vec()
+                    .try_into()
+                    .expect("32 bytes is valid U256"),
+                min_ntime: active.job_state.min_ntime,
+                nbits: active.job_state.nbits,
+            };
+            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+        }
+
+        // Send NewExtendedMiningJob.
+        let ext_job_msg = build_extended_job_message(channel_id, &active.job_state);
+        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
+        send_message(state, &ctx.connections, session.downstream_id, any).await?;
+    }
+
+    // Initialize a difficulty adjuster for this channel.
+    let adjuster = DifficultyAdjuster::new(SV2_START_DIFFICULTY, SV2_MINIMUM_DIFFICULTY, None);
+    session.difficulty_adjusters.insert(channel_id, adjuster);
+
+    info!(
+        downstream_id = session.downstream_id,
+        channel_id, "SV2 extended mining channel opened"
+    );
+
+    Ok(())
+}
+
+/// Build a `NewExtendedMiningJob` message from an extended job state.
+fn build_extended_job_message(
+    channel_id: u32,
+    job_state: &Sv2ExtendedJobState,
+) -> NewExtendedMiningJob<'static> {
+    use stratum_core::binary_sv2::{B064K, Seq0255, Sv2Option, U256};
+
+    let min_ntime: Sv2Option<'static, u32> = if job_state.is_future {
+        Sv2Option::new(None)
+    } else {
+        Sv2Option::new(Some(job_state.min_ntime))
+    };
+
+    let path_u256s: Vec<U256<'static>> = job_state
+        .merkle_path
+        .iter()
+        .map(|h| h.to_vec().try_into().expect("32 bytes is valid U256"))
+        .collect();
+    let merkle_path: Seq0255<'static, U256<'static>> = path_u256s.into();
+
+    let prefix: B064K<'static> = job_state
+        .coinbase_tx_prefix
+        .clone()
+        .try_into()
+        .expect("coinbase prefix fits in B064K");
+    let suffix: B064K<'static> = job_state
+        .coinbase_tx_suffix
+        .clone()
+        .try_into()
+        .expect("coinbase suffix fits in B064K");
+
+    NewExtendedMiningJob {
+        channel_id,
+        job_id: job_state.job_id,
+        min_ntime,
+        version: job_state.version,
+        version_rolling_allowed: true,
+        merkle_path,
+        coinbase_tx_prefix: prefix,
+        coinbase_tx_suffix: suffix,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SubmitSharesStandard handler
 // ---------------------------------------------------------------------------
 
@@ -621,10 +818,160 @@ async fn handle_submit_shares_standard(
 }
 
 // ---------------------------------------------------------------------------
+// SubmitSharesExtended handler
+// ---------------------------------------------------------------------------
+
+async fn handle_submit_shares_extended(
+    submit: SubmitSharesExtended<'static>,
+    session: &mut Sv2Session,
+    ctx: &Sv2ConnectionContext,
+    state: &Arc<tokio::sync::Mutex<State>>,
+) -> Result<(), Sv2Error> {
+    let channel_id = submit.channel_id;
+    let job_id = submit.job_id;
+    let seq_num = submit.sequence_number;
+
+    // Look up extended job state.
+    let job_state = match ctx.job_distributor.get_extended_job_state(job_id).await? {
+        Some(s) => s,
+        None => {
+            let err_resp = build_submit_error(channel_id, seq_num, "stale-share");
+            let any = AnyMessage::Mining(Mining::SubmitSharesError(err_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+            debug!(
+                downstream_id = session.downstream_id,
+                job_id, "stale extended share (unknown job_id)"
+            );
+            return Ok(());
+        }
+    };
+
+    // Look up extended channel.
+    let channel = match ctx.channels.get_extended_channel(channel_id).await? {
+        Some(c) => c,
+        None => {
+            let err_resp = build_submit_error(channel_id, seq_num, "unknown-user");
+            let any = AnyMessage::Mining(Mining::SubmitSharesError(err_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+            warn!(
+                downstream_id = session.downstream_id,
+                channel_id, "unknown extended channel_id"
+            );
+            return Ok(());
+        }
+    };
+
+    // Get current channel difficulty.
+    let channel_difficulty = session
+        .difficulty_adjusters
+        .get(&channel_id)
+        .map(|adj| adj.get_current_difficulty())
+        .unwrap_or(SV2_START_DIFFICULTY);
+
+    // Validate the extended share.
+    match validate_extended_share(&submit, &job_state, &channel) {
+        Ok(validation) => {
+            if !validation.meets_channel_target {
+                let err_resp = build_submit_error(channel_id, seq_num, "low-difficulty-share");
+                let any = AnyMessage::Mining(Mining::SubmitSharesError(err_resp));
+                send_message(state, &ctx.connections, session.downstream_id, any).await?;
+                return Ok(());
+            }
+
+            // Emit to accounting pipeline.
+            if let Err(e) = emit_extended_share(
+                &submit,
+                &validation,
+                &job_state,
+                &channel,
+                &ctx.emissions_tx,
+                channel_difficulty,
+            )
+            .await
+            {
+                warn!(
+                    downstream_id = session.downstream_id,
+                    "failed to emit extended share: {e}"
+                );
+            }
+
+            // Record share in difficulty adjuster and check for retarget.
+            let new_difficulty =
+                if let Some(adjuster) = session.difficulty_adjusters.get_mut(&channel_id) {
+                    let (new_diff, _is_first) = adjuster.record_share_submission(
+                        channel_difficulty as u128,
+                        job_id as u64,
+                        None,
+                        std::time::SystemTime::now(),
+                    );
+                    new_diff
+                } else {
+                    None
+                };
+
+            // If difficulty changed, update channel target and send SetTarget.
+            if let Some(new_diff) = new_difficulty {
+                let new_target = difficulty_to_target(new_diff);
+                let _ = ctx.channels.update_target(channel_id, new_target).await;
+
+                let set_target = SetTarget {
+                    channel_id,
+                    maximum_target: new_target
+                        .to_vec()
+                        .try_into()
+                        .expect("32 bytes is valid U256"),
+                };
+                let any = AnyMessage::Mining(Mining::SetTarget(set_target));
+                send_message(state, &ctx.connections, session.downstream_id, any).await?;
+
+                info!(
+                    downstream_id = session.downstream_id,
+                    channel_id,
+                    new_difficulty = new_diff,
+                    "SV2 extended channel difficulty adjusted, sent SetTarget"
+                );
+            }
+
+            // Send success response.
+            session.accepted_shares += 1;
+            session.shares_sum += channel_difficulty;
+            let success_resp = build_submit_success(
+                channel_id,
+                seq_num,
+                session.accepted_shares,
+                session.shares_sum,
+            );
+            let any = AnyMessage::Mining(Mining::SubmitSharesSuccess(success_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+        }
+        Err(e) => {
+            let reason = match &e {
+                Sv2Error::InvalidMessage(msg) if msg.contains("future") => "stale-share",
+                Sv2Error::InvalidMessage(msg) if msg.contains("extranonce") => "invalid-extranonce",
+                _ => "bad-nonce",
+            };
+            let err_resp = build_submit_error(channel_id, seq_num, reason);
+            let any = AnyMessage::Mining(Mining::SubmitSharesError(err_resp));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+            debug!(
+                downstream_id = session.downstream_id,
+                "extended share validation error: {e}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Writer task
 // ---------------------------------------------------------------------------
 
 /// Writer task: sends pre-encoded frames from msg_rx and pushes job updates.
+///
+/// `extended_channel_ids` is shared state indicating which extended channels
+/// this connection has. When job events arrive, the writer sends
+/// `NewExtendedMiningJob` for each extended channel owned by this connection.
 async fn writer_task(
     mut writer: OwnedWriteHalf,
     state: Arc<tokio::sync::Mutex<State>>,
@@ -632,6 +979,7 @@ async fn writer_task(
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     mut job_events: watch::Receiver<Option<JobEvent>>,
     downstream_id: DownstreamId,
+    extended_channel_ids: Arc<tokio::sync::Mutex<Vec<u32>>>,
 ) {
     loop {
         tokio::select! {
@@ -720,6 +1068,59 @@ async fn writer_task(
                         }
                         Err(e) => {
                             warn!(downstream_id, "failed to encode NewMiningJob: {e}");
+                        }
+                    }
+
+                    // Send NewExtendedMiningJob for each extended channel
+                    // owned by this connection.
+                    let ext_ids = extended_channel_ids.lock().await;
+                    for ext_event in &event.extended_jobs {
+                        if !ext_ids.contains(&ext_event.channel_id) {
+                            continue;
+                        }
+
+                        // Send SetNewPrevHash for this extended channel
+                        if let Some(prev_hash) = ext_event.job_state.prev_hash {
+                            let prev_hash_msg = SetNewPrevHash {
+                                channel_id: ext_event.channel_id,
+                                job_id: ext_event.job_state.job_id,
+                                prev_hash: prev_hash
+                                    .to_vec()
+                                    .try_into()
+                                    .expect("32 bytes is valid U256"),
+                                min_ntime: ext_event.job_state.min_ntime,
+                                nbits: ext_event.job_state.nbits,
+                            };
+                            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+                            match encode_message(&state, any).await {
+                                Ok(bytes) => {
+                                    if let Err(e) = writer.write_all(&bytes).await {
+                                        debug!(downstream_id, "SV2 write ext prev_hash failed: {e}");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(downstream_id, "failed to encode ext SetNewPrevHash: {e}");
+                                }
+                            }
+                        }
+
+                        // Send NewExtendedMiningJob
+                        let ext_job_msg = build_extended_job_message(
+                            ext_event.channel_id,
+                            &ext_event.job_state,
+                        );
+                        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
+                        match encode_message(&state, any).await {
+                            Ok(bytes) => {
+                                if let Err(e) = writer.write_all(&bytes).await {
+                                    debug!(downstream_id, "SV2 write ext job failed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(downstream_id, "failed to encode NewExtendedMiningJob: {e}");
+                            }
                         }
                     }
                 }

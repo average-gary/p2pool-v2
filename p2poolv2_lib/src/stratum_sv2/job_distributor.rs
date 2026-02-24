@@ -50,7 +50,10 @@ use crate::shares::share_commitment::ShareCommitment;
 use crate::stratum::work::block_template::BlockTemplate;
 
 use super::error::Sv2Error;
-use super::work::{Sv2JobParams, Sv2JobState, build_new_mining_job};
+use super::work::{
+    Sv2ExtendedJobState, Sv2JobParams, Sv2JobState, build_new_extended_mining_job,
+    build_new_mining_job,
+};
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -84,6 +87,23 @@ pub enum JobDistributorCmd {
     },
     /// Unregister a group channel (downstream disconnected).
     UnregisterGroup { group_channel_id: u32 },
+    /// Register an extended channel for job distribution.
+    RegisterExtendedChannel {
+        channel_id: u32,
+        extranonce_prefix: Vec<u8>,
+    },
+    /// Unregister an extended channel.
+    UnregisterExtendedChannel { channel_id: u32 },
+    /// Get the current active extended job for a channel (bootstrap).
+    GetActiveExtendedJob {
+        channel_id: u32,
+        reply: oneshot::Sender<Option<ActiveExtendedJobInfo>>,
+    },
+    /// Get an extended job state by job_id (for share validation).
+    GetExtendedJobState {
+        job_id: u32,
+        reply: oneshot::Sender<Option<Sv2ExtendedJobState>>,
+    },
 }
 
 /// Info about the currently active job for a group channel.
@@ -99,6 +119,15 @@ pub struct ActiveJobInfo {
     pub nbits: Option<u32>,
     /// The full job state for share validation.
     pub job_state: Sv2JobState,
+}
+
+/// Info about the currently active extended job for an extended channel.
+#[derive(Debug, Clone)]
+pub struct ActiveExtendedJobInfo {
+    /// The job ID.
+    pub job_id: u32,
+    /// The full extended job state for share validation and bootstrap.
+    pub job_state: Sv2ExtendedJobState,
 }
 
 /// Callback for sending job messages to downstreams.
@@ -123,6 +152,14 @@ struct GroupState {
     active_job: Option<Sv2JobState>,
 }
 
+/// Per-extended-channel state tracked by the distributor.
+struct ExtendedChannelState {
+    /// The extranonce prefix for this extended channel.
+    extranonce_prefix: Vec<u8>,
+    /// The currently active extended job.
+    active_job: Option<Sv2ExtendedJobState>,
+}
+
 // ---------------------------------------------------------------------------
 // Actor
 // ---------------------------------------------------------------------------
@@ -139,10 +176,14 @@ struct CachedJobParams {
 
 /// Internal actor state for the job distributor.
 struct Sv2JobDistributor {
-    /// Per-group channel state.
+    /// Per-group channel state (standard channels).
     groups: HashMap<u32, GroupState>,
-    /// All job states, keyed by job_id (for share validation lookup).
+    /// Per-extended-channel state.
+    extended_channels: HashMap<u32, ExtendedChannelState>,
+    /// All standard job states, keyed by job_id (for share validation lookup).
     job_states: HashMap<u32, Sv2JobState>,
+    /// All extended job states, keyed by job_id (for share validation lookup).
+    extended_job_states: HashMap<u32, Sv2ExtendedJobState>,
     /// The most recent previous block hash seen (for detecting new blocks).
     last_prev_hash: Option<String>,
     /// The most recent block template.
@@ -151,7 +192,7 @@ struct Sv2JobDistributor {
     last_job_params: Option<CachedJobParams>,
     /// Server ID for extranonce prefix generation.
     _server_id: u16,
-    /// Watch channel for broadcasting new job events.
+    /// Watch channel for broadcasting new job events (standard + extended).
     /// Receivers can subscribe to be notified when jobs change.
     job_event_tx: watch::Sender<Option<JobEvent>>,
     /// Max number of job states to retain (prevents memory growth).
@@ -167,8 +208,22 @@ pub struct JobEvent {
     pub job_id: u32,
     /// Whether this is a new-block event (clean jobs).
     pub clean_jobs: bool,
-    /// The full job state.
+    /// The full job state (standard channels).
     pub job_state: Sv2JobState,
+    /// Extended job info, if this event also carries an extended job.
+    /// Each extended channel gets its own job, but we piggyback on the same
+    /// watch channel. The handler's writer task checks `extended_jobs` to
+    /// see if any belong to its connection's extended channels.
+    pub extended_jobs: Vec<ExtendedJobEvent>,
+}
+
+/// Extended job info carried within a [`JobEvent`].
+#[derive(Debug, Clone)]
+pub struct ExtendedJobEvent {
+    /// The extended channel ID this job is for.
+    pub channel_id: u32,
+    /// The extended job state.
+    pub job_state: Sv2ExtendedJobState,
 }
 
 impl Sv2JobDistributor {
@@ -177,7 +232,9 @@ impl Sv2JobDistributor {
         (
             Self {
                 groups: HashMap::new(),
+                extended_channels: HashMap::new(),
                 job_states: HashMap::new(),
+                extended_job_states: HashMap::new(),
                 last_prev_hash: None,
                 last_template: None,
                 last_job_params: None,
@@ -225,8 +282,45 @@ impl Sv2JobDistributor {
             share_commitment: share_commitment.clone(),
         });
 
-        // Build a job for each registered group
+        // Build extended jobs for registered extended channels
+        let ext_channel_ids: Vec<u32> = self.extended_channels.keys().cloned().collect();
+        let mut extended_job_events = Vec::new();
+        for ext_ch_id in ext_channel_ids {
+            let params = Sv2JobParams {
+                output_distribution: output_distribution.clone(),
+                pool_signature: pool_signature.clone(),
+                commitment_hash,
+                share_commitment: share_commitment.clone(),
+                is_future: false,
+            };
+
+            match build_new_extended_mining_job(&template, ext_ch_id, &params) {
+                Ok((_, ext_job_state)) => {
+                    let job_id = ext_job_state.job_id;
+                    self.extended_job_states
+                        .insert(job_id, ext_job_state.clone());
+
+                    if let Some(ch_state) = self.extended_channels.get_mut(&ext_ch_id) {
+                        ch_state.active_job = Some(ext_job_state.clone());
+                    }
+
+                    extended_job_events.push(ExtendedJobEvent {
+                        channel_id: ext_ch_id,
+                        job_state: ext_job_state,
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        ext_ch_id,
+                        "failed to build SV2 extended job for channel: {e}"
+                    );
+                }
+            }
+        }
+
+        // Build a standard job for each registered group
         let group_ids: Vec<u32> = self.groups.keys().cloned().collect();
+        let has_groups = !group_ids.is_empty();
         for group_channel_id in group_ids {
             let extranonce = match self.groups.get(&group_channel_id) {
                 Some(gs) => gs.extranonce.clone(),
@@ -253,18 +347,55 @@ impl Sv2JobDistributor {
                         group.active_job = Some(job_state.clone());
                     }
 
-                    // Emit job event
+                    // Emit job event (includes any extended jobs built above)
                     let event = JobEvent {
                         group_channel_id,
                         job_id,
                         clean_jobs,
                         job_state,
+                        extended_jobs: extended_job_events.clone(),
                     };
                     let _ = self.job_event_tx.send(Some(event));
                 }
                 Err(e) => {
                     warn!(group_channel_id, "failed to build SV2 job for group: {e}");
                 }
+            }
+        }
+
+        // If there are extended jobs but no standard groups, still emit an event
+        // so the writer tasks for extended-only connections get notified.
+        if !has_groups && !extended_job_events.is_empty() {
+            // Use a sentinel job event with group_channel_id=0
+            if let Some(first_ext) = extended_job_events.first() {
+                let event = JobEvent {
+                    group_channel_id: 0,
+                    job_id: first_ext.job_state.job_id,
+                    clean_jobs,
+                    // We need a Sv2JobState for the event, but for extended-only
+                    // we don't have one. Use a dummy standard job state.
+                    // The handler's writer task will check extended_jobs instead.
+                    job_state: Sv2JobState {
+                        job_id: first_ext.job_state.job_id,
+                        template: Arc::clone(&first_ext.job_state.template),
+                        coinbase: bitcoin::consensus::deserialize(&{
+                            let mut bytes = first_ext.job_state.coinbase_tx_prefix.clone();
+                            bytes.extend_from_slice(&[0u8; 12]);
+                            bytes.extend_from_slice(&first_ext.job_state.coinbase_tx_suffix);
+                            bytes
+                        })
+                        .expect("valid coinbase"),
+                        merkle_root: [0u8; 32],
+                        version: first_ext.job_state.version,
+                        is_future: first_ext.job_state.is_future,
+                        prev_hash: first_ext.job_state.prev_hash,
+                        nbits: first_ext.job_state.nbits,
+                        min_ntime: first_ext.job_state.min_ntime,
+                        share_commitment: first_ext.job_state.share_commitment.clone(),
+                    },
+                    extended_jobs: extended_job_events,
+                };
+                let _ = self.job_event_tx.send(Some(event));
             }
         }
 
@@ -337,15 +468,88 @@ impl Sv2JobDistributor {
         self.job_states.get(&job_id).cloned()
     }
 
+    fn handle_register_extended_channel(&mut self, channel_id: u32, extranonce_prefix: Vec<u8>) {
+        debug!(
+            channel_id,
+            "registered extended channel for job distribution"
+        );
+        self.extended_channels.insert(
+            channel_id,
+            ExtendedChannelState {
+                extranonce_prefix,
+                active_job: None,
+            },
+        );
+
+        // Bootstrap: if we have a template, immediately build an extended job
+        if let (Some(template), Some(cached)) =
+            (self.last_template.clone(), self.last_job_params.clone())
+        {
+            let params = Sv2JobParams {
+                output_distribution: cached.output_distribution,
+                pool_signature: cached.pool_signature,
+                commitment_hash: cached.commitment_hash,
+                share_commitment: cached.share_commitment,
+                is_future: false,
+            };
+
+            match build_new_extended_mining_job(&template, channel_id, &params) {
+                Ok((_, ext_job_state)) => {
+                    self.extended_job_states
+                        .insert(ext_job_state.job_id, ext_job_state.clone());
+                    if let Some(ch_state) = self.extended_channels.get_mut(&channel_id) {
+                        ch_state.active_job = Some(ext_job_state);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        channel_id,
+                        "failed to bootstrap extended job for new channel: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn handle_unregister_extended_channel(&mut self, channel_id: u32) {
+        debug!(
+            channel_id,
+            "unregistered extended channel from job distribution"
+        );
+        self.extended_channels.remove(&channel_id);
+    }
+
+    fn handle_get_active_extended_job(&self, channel_id: u32) -> Option<ActiveExtendedJobInfo> {
+        let ch_state = self.extended_channels.get(&channel_id)?;
+        let job_state = ch_state.active_job.as_ref()?;
+
+        Some(ActiveExtendedJobInfo {
+            job_id: job_state.job_id,
+            job_state: job_state.clone(),
+        })
+    }
+
+    fn handle_get_extended_job_state(&self, job_id: u32) -> Option<Sv2ExtendedJobState> {
+        self.extended_job_states.get(&job_id).cloned()
+    }
+
     /// Remove old job states beyond the retention limit.
     fn gc_job_states(&mut self) {
         if self.job_states.len() > self.max_retained_jobs {
-            // Keep only the most recent jobs
             let mut ids: Vec<u32> = self.job_states.keys().cloned().collect();
             ids.sort();
             let to_remove = ids.len() - self.max_retained_jobs;
             for id in ids.into_iter().take(to_remove) {
                 self.job_states.remove(&id);
+            }
+        }
+
+        if self.extended_job_states.len() > self.max_retained_jobs {
+            let mut ids: Vec<u32> = self.extended_job_states.keys().cloned().collect();
+            ids.sort();
+            let to_remove = ids.len() - self.max_retained_jobs;
+            for id in ids.into_iter().take(to_remove) {
+                self.extended_job_states.remove(&id);
             }
         }
     }
@@ -386,6 +590,21 @@ impl Sv2JobDistributor {
                 }
                 JobDistributorCmd::UnregisterGroup { group_channel_id } => {
                     self.handle_unregister_group(group_channel_id);
+                }
+                JobDistributorCmd::RegisterExtendedChannel {
+                    channel_id,
+                    extranonce_prefix,
+                } => {
+                    self.handle_register_extended_channel(channel_id, extranonce_prefix);
+                }
+                JobDistributorCmd::UnregisterExtendedChannel { channel_id } => {
+                    self.handle_unregister_extended_channel(channel_id);
+                }
+                JobDistributorCmd::GetActiveExtendedJob { channel_id, reply } => {
+                    let _ = reply.send(self.handle_get_active_extended_job(channel_id));
+                }
+                JobDistributorCmd::GetExtendedJobState { job_id, reply } => {
+                    let _ = reply.send(self.handle_get_extended_job_state(job_id));
                 }
             }
         }
@@ -497,6 +716,67 @@ impl Sv2JobDistributorHandle {
             .send(JobDistributorCmd::UnregisterGroup { group_channel_id })
             .await
             .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))
+    }
+
+    /// Register an extended channel for job distribution.
+    pub async fn register_extended_channel(
+        &self,
+        channel_id: u32,
+        extranonce_prefix: Vec<u8>,
+    ) -> Result<(), Sv2Error> {
+        self.cmd_tx
+            .send(JobDistributorCmd::RegisterExtendedChannel {
+                channel_id,
+                extranonce_prefix,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))
+    }
+
+    /// Unregister an extended channel.
+    pub async fn unregister_extended_channel(&self, channel_id: u32) -> Result<(), Sv2Error> {
+        self.cmd_tx
+            .send(JobDistributorCmd::UnregisterExtendedChannel { channel_id })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))
+    }
+
+    /// Get the currently active extended job for an extended channel.
+    pub async fn get_active_extended_job(
+        &self,
+        channel_id: u32,
+    ) -> Result<Option<ActiveExtendedJobInfo>, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(JobDistributorCmd::GetActiveExtendedJob {
+                channel_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor reply dropped".to_string()))
+    }
+
+    /// Look up an extended job state by job_id (for share validation).
+    pub async fn get_extended_job_state(
+        &self,
+        job_id: u32,
+    ) -> Result<Option<Sv2ExtendedJobState>, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(JobDistributorCmd::GetExtendedJobState {
+                job_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("job distributor reply dropped".to_string()))
     }
 
     /// Subscribe to job events.

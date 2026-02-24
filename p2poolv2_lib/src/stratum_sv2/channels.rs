@@ -14,17 +14,35 @@
 // You should have received a copy of the GNU General Public License along with
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
-//! Standard Mining Channel management for SV2.
+//! Mining Channel management for SV2 (standard + extended).
 //!
 //! Each SV2 downstream connection can open one or more **standard mining
-//! channels**. Standard channels are used by end mining devices for
-//! header-only mining (HOM): the pool sends pre-computed `NewMiningJob`
-//! messages and the device manipulates nonce, nTime, and version bits.
+//! channels** or **extended mining channels**.
+//!
+//! **Standard channels** are used by end mining devices for header-only
+//! mining (HOM): the pool sends pre-computed `NewMiningJob` messages and
+//! the device manipulates nonce, nTime, and version bits.
+//!
+//! **Extended channels** are used by mining proxies. The proxy receives
+//! `NewExtendedMiningJob` messages with merkle_path + coinbase
+//! prefix/suffix, and computes merkle roots locally after inserting
+//! extranonce values. This allows a proxy to distribute work to many
+//! downstream devices without the pool knowing about each individual one.
 //!
 //! Every standard channel belongs to a **group channel**. All channels on
 //! the same downstream connection share a single group channel, enabling
 //! efficient job multicast (one `SetNewPrevHash` / `NewMiningJob` per group
 //! instead of per channel).
+//!
+//! Extended channels are tracked separately — each extended channel gets
+//! its own `channel_id` and extranonce prefix, and receives
+//! `NewExtendedMiningJob` messages instead of `NewMiningJob`.
+//!
+//! # Extranonce Layout
+//!
+//! The coinbase has a fixed 12-byte extranonce slot. The split is:
+//! - **Standard channels**: pool fills all 12 bytes (6-byte prefix + 6 zero-padded)
+//! - **Extended channels**: 6-byte pool prefix + 6-byte proxy search space
 //!
 //! # Architecture
 //!
@@ -38,7 +56,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use stratum_core::binary_sv2::{B032, Str0255, U256};
 use stratum_core::mining_sv2::{
-    OpenMiningChannelError, OpenStandardMiningChannel, OpenStandardMiningChannelSuccess,
+    OpenExtendedMiningChannel, OpenExtendedMiningChannelSuccess, OpenMiningChannelError,
+    OpenStandardMiningChannel, OpenStandardMiningChannelSuccess,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::debug;
@@ -113,6 +132,64 @@ pub struct StandardChannel {
 }
 
 // ---------------------------------------------------------------------------
+// Extranonce constants
+// ---------------------------------------------------------------------------
+
+/// Size of the pool-assigned extranonce prefix in bytes.
+///
+/// The coinbase has a fixed 12-byte extranonce slot. Standard channels use
+/// a 6-byte prefix (server_id + channel_id). Extended channels use the same
+/// 6-byte prefix, leaving 6 bytes for the proxy's search space.
+pub const EXTRANONCE_PREFIX_SIZE: usize = 6;
+
+/// Size of the proxy-controlled extranonce in bytes for extended channels.
+///
+/// `TOTAL_EXTRANONCE_SIZE (12) - EXTRANONCE_PREFIX_SIZE (6) = 6`.
+pub const EXTENDED_EXTRANONCE_SIZE: u16 = 6;
+
+/// Total extranonce slot size in the coinbase (must match EXTRANONCE1_SIZE + EXTRANONCE2_SIZE).
+pub const TOTAL_EXTRANONCE_SIZE: usize = 12;
+
+// ---------------------------------------------------------------------------
+// Per-channel state (extended)
+// ---------------------------------------------------------------------------
+
+/// State for a single open extended mining channel.
+///
+/// Extended channels are used by mining proxies that need to split the
+/// extranonce search space among their own downstream devices. The proxy
+/// receives `NewExtendedMiningJob` with merkle_path + coinbase prefix/suffix
+/// and computes merkle roots locally.
+#[derive(Debug, Clone)]
+pub struct ExtendedChannel {
+    /// Unique channel identifier (assigned by pool, same counter as standard).
+    pub channel_id: u32,
+    /// The downstream connection that owns this channel.
+    pub downstream_id: DownstreamId,
+    /// Validated Bitcoin address from `user_identity`.
+    pub btc_address: String,
+    /// Optional worker name (from `user_identity` after the dot).
+    pub worker_name: Option<String>,
+    /// User ID from the share chain store.
+    pub user_id: u64,
+    /// Nominal hash rate reported by the proxy (h/s).
+    pub nominal_hash_rate: f32,
+    /// The extranonce prefix assigned to this channel (6 bytes).
+    pub extranonce_prefix: Vec<u8>,
+    /// Number of extranonce bytes controlled by the proxy (always 6 for now).
+    pub extranonce_size: u16,
+    /// Current mining target for this channel.
+    pub target: [u8; 32],
+}
+
+/// Result of a successful extended channel open.
+#[derive(Debug)]
+pub struct ExtendedChannelOpenSuccess {
+    pub response: OpenExtendedMiningChannelSuccess<'static>,
+    pub channel: ExtendedChannel,
+}
+
+// ---------------------------------------------------------------------------
 // Per-downstream group state
 // ---------------------------------------------------------------------------
 
@@ -169,11 +246,30 @@ enum ChannelCmd {
         downstream_id: DownstreamId,
         reply: oneshot::Sender<Option<u32>>,
     },
-    /// Update the mining target for a specific channel.
+    /// Update the mining target for a specific channel (standard or extended).
     UpdateTarget {
         channel_id: u32,
         new_target: [u8; 32],
         reply: oneshot::Sender<bool>,
+    },
+    /// Open a new extended mining channel.
+    OpenExtended {
+        downstream_id: DownstreamId,
+        msg: OpenExtendedMiningChannel<'static>,
+        btc_address: String,
+        worker_name: Option<String>,
+        user_id: u64,
+        reply: oneshot::Sender<Result<ExtendedChannelOpenSuccess, OpenMiningChannelError<'static>>>,
+    },
+    /// Get an extended channel by its ID.
+    GetExtendedChannel {
+        channel_id: u32,
+        reply: oneshot::Sender<Option<ExtendedChannel>>,
+    },
+    /// Get all extended channel IDs for a downstream.
+    GetExtendedChannelsForDownstream {
+        downstream_id: DownstreamId,
+        reply: oneshot::Sender<Vec<u32>>,
     },
 }
 
@@ -185,8 +281,12 @@ enum ChannelCmd {
 struct Sv2ChannelManager {
     /// All open standard channels, keyed by channel_id.
     channels: HashMap<u32, StandardChannel>,
-    /// Per-downstream group tracking.
+    /// All open extended channels, keyed by channel_id.
+    extended_channels: HashMap<u32, ExtendedChannel>,
+    /// Per-downstream group tracking (standard channels only).
     downstream_groups: HashMap<DownstreamId, DownstreamGroup>,
+    /// Per-downstream extended channel tracking.
+    downstream_extended: HashMap<DownstreamId, Vec<u32>>,
     /// Server ID for extranonce prefix generation.
     server_id: u16,
     /// Default initial target for new channels (32 bytes, big-endian).
@@ -197,7 +297,9 @@ impl Sv2ChannelManager {
     fn new(server_id: u16, default_target: [u8; 32]) -> Self {
         Self {
             channels: HashMap::new(),
+            extended_channels: HashMap::new(),
             downstream_groups: HashMap::new(),
+            downstream_extended: HashMap::new(),
             server_id,
             default_target,
         }
@@ -303,13 +405,28 @@ impl Sv2ChannelManager {
     }
 
     fn handle_remove_downstream(&mut self, downstream_id: DownstreamId) {
+        let mut removed_standard = 0;
+        let mut removed_extended = 0;
+
         if let Some(group) = self.downstream_groups.remove(&downstream_id) {
             for ch_id in &group.channel_ids {
                 self.channels.remove(ch_id);
             }
+            removed_standard = group.channel_ids.len();
+        }
+
+        if let Some(ext_ids) = self.downstream_extended.remove(&downstream_id) {
+            for ch_id in &ext_ids {
+                self.extended_channels.remove(ch_id);
+            }
+            removed_extended = ext_ids.len();
+        }
+
+        if removed_standard > 0 || removed_extended > 0 {
             debug!(
                 downstream_id,
-                removed = group.channel_ids.len(),
+                removed_standard,
+                removed_extended,
                 "removed all channels for disconnected downstream"
             );
         }
@@ -324,11 +441,114 @@ impl Sv2ChannelManager {
     fn handle_update_target(&mut self, channel_id: u32, new_target: [u8; 32]) -> bool {
         if let Some(channel) = self.channels.get_mut(&channel_id) {
             channel.target = new_target;
-            debug!(channel_id, "updated channel target");
+            debug!(channel_id, "updated standard channel target");
+            true
+        } else if let Some(channel) = self.extended_channels.get_mut(&channel_id) {
+            channel.target = new_target;
+            debug!(channel_id, "updated extended channel target");
             true
         } else {
             false
         }
+    }
+
+    /// Handle an extended channel open request.
+    ///
+    /// Extended channels are used by mining proxies. The proxy gets:
+    /// - A unique `extranonce_prefix` (6 bytes)
+    /// - An `extranonce_size` indicating how many bytes the proxy controls (6 bytes)
+    /// - `NewExtendedMiningJob` messages with merkle_path + coinbase prefix/suffix
+    fn handle_open_extended(
+        &mut self,
+        downstream_id: DownstreamId,
+        msg: &OpenExtendedMiningChannel<'static>,
+        btc_address: String,
+        worker_name: Option<String>,
+        user_id: u64,
+    ) -> Result<ExtendedChannelOpenSuccess, OpenMiningChannelError<'static>> {
+        // Reject if proxy requests more extranonce space than we can provide
+        if msg.min_extranonce_size > EXTENDED_EXTRANONCE_SIZE {
+            return Err(OpenMiningChannelError {
+                request_id: msg.request_id,
+                error_code: "unsupported-min-extranonce-size"
+                    .to_string()
+                    .try_into()
+                    .expect("static error code"),
+            });
+        }
+
+        let channel_id = next_channel_id();
+
+        // Build extranonce prefix (same scheme as standard channels)
+        let extranonce_prefix = build_extranonce_prefix(self.server_id, channel_id);
+
+        // Extended channels don't use the group channel mechanism.
+        // Each extended channel is independent — the proxy manages its
+        // own downstream device grouping internally.
+        //
+        // We use group_channel_id = 0 per the SV2 spec for extended channels
+        // that don't belong to a specific group.
+        let group_channel_id = 0;
+
+        let channel = ExtendedChannel {
+            channel_id,
+            downstream_id,
+            btc_address,
+            worker_name,
+            user_id,
+            nominal_hash_rate: msg.nominal_hash_rate,
+            extranonce_prefix: extranonce_prefix.clone(),
+            extranonce_size: EXTENDED_EXTRANONCE_SIZE,
+            target: self.default_target,
+        };
+
+        // Build the success response
+        let target_bytes: U256<'static> = self
+            .default_target
+            .to_vec()
+            .try_into()
+            .expect("32-byte target is always valid U256");
+
+        let extranonce_b032: B032<'static> = extranonce_prefix
+            .try_into()
+            .expect("6-byte extranonce prefix fits in B032");
+
+        let response = OpenExtendedMiningChannelSuccess {
+            request_id: msg.request_id,
+            channel_id,
+            target: target_bytes,
+            extranonce_size: EXTENDED_EXTRANONCE_SIZE,
+            extranonce_prefix: extranonce_b032,
+            group_channel_id,
+        };
+
+        debug!(
+            channel_id,
+            downstream_id,
+            user_id,
+            extranonce_size = EXTENDED_EXTRANONCE_SIZE,
+            nominal_hash_rate = msg.nominal_hash_rate,
+            "opened extended mining channel"
+        );
+
+        self.extended_channels.insert(channel_id, channel.clone());
+        self.downstream_extended
+            .entry(downstream_id)
+            .or_default()
+            .push(channel_id);
+
+        Ok(ExtendedChannelOpenSuccess { response, channel })
+    }
+
+    fn handle_get_extended_channel(&self, channel_id: u32) -> Option<ExtendedChannel> {
+        self.extended_channels.get(&channel_id).cloned()
+    }
+
+    fn handle_get_extended_channels_for_downstream(&self, downstream_id: DownstreamId) -> Vec<u32> {
+        self.downstream_extended
+            .get(&downstream_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Run the actor event loop.
@@ -360,7 +580,7 @@ impl Sv2ChannelManager {
                     self.handle_remove_downstream(downstream_id);
                 }
                 ChannelCmd::GetCount { reply } => {
-                    let _ = reply.send(self.channels.len());
+                    let _ = reply.send(self.channels.len() + self.extended_channels.len());
                 }
                 ChannelCmd::GetGroupChannelId {
                     downstream_id,
@@ -374,6 +594,33 @@ impl Sv2ChannelManager {
                     reply,
                 } => {
                     let _ = reply.send(self.handle_update_target(channel_id, new_target));
+                }
+                ChannelCmd::OpenExtended {
+                    downstream_id,
+                    msg,
+                    btc_address,
+                    worker_name,
+                    user_id,
+                    reply,
+                } => {
+                    let result = self.handle_open_extended(
+                        downstream_id,
+                        &msg,
+                        btc_address,
+                        worker_name,
+                        user_id,
+                    );
+                    let _ = reply.send(result);
+                }
+                ChannelCmd::GetExtendedChannel { channel_id, reply } => {
+                    let _ = reply.send(self.handle_get_extended_channel(channel_id));
+                }
+                ChannelCmd::GetExtendedChannelsForDownstream {
+                    downstream_id,
+                    reply,
+                } => {
+                    let _ =
+                        reply.send(self.handle_get_extended_channels_for_downstream(downstream_id));
                 }
             }
         }
@@ -544,6 +791,88 @@ impl Sv2ChannelHandle {
             .await
             .map_err(|_| Sv2Error::ChannelError("channel manager reply dropped".to_string()))
     }
+
+    /// Open a new extended mining channel.
+    ///
+    /// The caller must have already:
+    /// 1. Validated the Bitcoin address via `validate_username`
+    /// 2. Registered the user via `ChainStoreHandle::add_user`
+    ///
+    /// This method allocates the channel ID and extranonce prefix, then
+    /// returns the SV2 success response message along with the internal
+    /// channel state.
+    ///
+    /// If the proxy requests `min_extranonce_size > 6`, the request is
+    /// rejected with `unsupported-min-extranonce-size`.
+    pub async fn open_extended_channel(
+        &self,
+        downstream_id: DownstreamId,
+        msg: OpenExtendedMiningChannel<'static>,
+        btc_address: String,
+        worker_name: Option<String>,
+        user_id: u64,
+    ) -> Result<ExtendedChannelOpenSuccess, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCmd::OpenExtended {
+                downstream_id,
+                msg,
+                btc_address,
+                worker_name,
+                user_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager actor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager reply dropped".to_string()))?
+            .map_err(|e| {
+                Sv2Error::InvalidMessage(format!(
+                    "extended channel open rejected: {:?}",
+                    e.error_code
+                ))
+            })
+    }
+
+    /// Look up an extended channel by its ID.
+    pub async fn get_extended_channel(
+        &self,
+        channel_id: u32,
+    ) -> Result<Option<ExtendedChannel>, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCmd::GetExtendedChannel {
+                channel_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager actor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager reply dropped".to_string()))
+    }
+
+    /// Get all extended channel IDs for a given downstream connection.
+    pub async fn get_extended_channels_for_downstream(
+        &self,
+        downstream_id: DownstreamId,
+    ) -> Result<Vec<u32>, Sv2Error> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(ChannelCmd::GetExtendedChannelsForDownstream {
+                downstream_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager actor stopped".to_string()))?;
+
+        reply_rx
+            .await
+            .map_err(|_| Sv2Error::ChannelError("channel manager reply dropped".to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -595,11 +924,16 @@ pub async fn validate_and_register_user(
     ))
 }
 
-/// Build an `OpenMiningChannelError` response for an invalid user identity.
+/// Build an `OpenMiningChannelError` response for a channel open failure.
+///
+/// Maps reason strings to SV2 spec error codes:
+/// - `'unknown-user'` for address validation failures
+/// - `'max-target-out-of-range'` for target issues
+/// - `'unsupported-min-extranonce-size'` for extended channel extranonce requests
 pub fn build_open_channel_error(request_id: u32, reason: &str) -> OpenMiningChannelError<'static> {
-    // The SV2 spec defines error codes: 'unknown-user', 'max-target-out-of-range'
-    // For address validation failures, 'unknown-user' is the closest match.
-    let error_code = if reason.contains("target") {
+    let error_code = if reason.contains("extranonce") {
+        "unsupported-min-extranonce-size"
+    } else if reason.contains("target") {
         "max-target-out-of-range"
     } else {
         "unknown-user"
@@ -879,5 +1213,286 @@ mod tests {
     fn test_build_open_channel_error_target() {
         let err = build_open_channel_error(7, "max target out of range");
         assert_eq!(err.request_id, 7);
+    }
+
+    #[test]
+    fn test_build_open_channel_error_extranonce() {
+        let err = build_open_channel_error(9, "unsupported extranonce size");
+        assert_eq!(err.request_id, 9);
+        let code_bytes: &[u8] = err.error_code.inner_as_ref();
+        let code_str = std::str::from_utf8(code_bytes).unwrap();
+        assert_eq!(code_str, "unsupported-min-extranonce-size");
+    }
+
+    // -------------------------------------------------------------------
+    // Extended channel tests
+    // -------------------------------------------------------------------
+
+    fn make_open_extended_channel_msg(
+        request_id: u32,
+        user_identity: &str,
+        nominal_hash_rate: f32,
+        min_extranonce_size: u16,
+    ) -> OpenExtendedMiningChannel<'static> {
+        let max_target: U256<'static> = [0xff; 32]
+            .to_vec()
+            .try_into()
+            .expect("32 bytes is valid U256");
+
+        OpenExtendedMiningChannel {
+            request_id,
+            user_identity: user_identity.to_string().try_into().expect("valid Str0255"),
+            nominal_hash_rate,
+            max_target,
+            min_extranonce_size,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_open_extended_channel() {
+        let handle = start_channel_manager(0, default_test_target());
+
+        let msg = make_open_extended_channel_msg(1, "tb1qproxy.worker1", 10_000_000.0, 4);
+        let result = handle
+            .open_extended_channel(
+                100,
+                msg,
+                "tb1qproxy".to_string(),
+                Some("worker1".to_string()),
+                42,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let success = result.unwrap();
+        assert_eq!(success.channel.btc_address, "tb1qproxy");
+        assert_eq!(success.channel.worker_name, Some("worker1".to_string()));
+        assert_eq!(success.channel.user_id, 42);
+        assert_eq!(success.channel.downstream_id, 100);
+        assert_eq!(success.channel.extranonce_size, EXTENDED_EXTRANONCE_SIZE);
+        assert_eq!(
+            success.channel.extranonce_prefix.len(),
+            EXTRANONCE_PREFIX_SIZE
+        );
+        assert_eq!(success.response.channel_id, success.channel.channel_id);
+        assert_eq!(success.response.extranonce_size, EXTENDED_EXTRANONCE_SIZE);
+        assert_eq!(success.response.group_channel_id, 0);
+    }
+
+    #[tokio::test]
+    async fn test_open_extended_channel_min_extranonce_exact() {
+        let handle = start_channel_manager(0, default_test_target());
+
+        // Request exactly 6 bytes — should succeed
+        let msg = make_open_extended_channel_msg(1, "tb1qproxy", 1_000_000.0, 6);
+        let result = handle
+            .open_extended_channel(100, msg, "tb1qproxy".to_string(), None, 1)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_open_extended_channel_rejects_large_extranonce() {
+        let handle = start_channel_manager(0, default_test_target());
+
+        // Request 8 bytes — exceeds our 6-byte limit, should fail
+        let msg = make_open_extended_channel_msg(1, "tb1qproxy", 1_000_000.0, 8);
+        let result = handle
+            .open_extended_channel(100, msg, "tb1qproxy".to_string(), None, 1)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("extranonce"), "error: {err_msg}");
+    }
+
+    #[tokio::test]
+    async fn test_extended_and_standard_coexist() {
+        let handle = start_channel_manager(0, default_test_target());
+        let downstream_id: DownstreamId = 200;
+
+        // Open a standard channel
+        let std_msg = make_open_channel_msg(1, "tb1qminer.w1", 500_000.0);
+        let std_result = handle
+            .open_standard_channel(
+                downstream_id,
+                std_msg,
+                "tb1qminer".to_string(),
+                Some("w1".to_string()),
+                10,
+            )
+            .await
+            .unwrap();
+
+        // Open an extended channel on the same downstream
+        let ext_msg = make_open_extended_channel_msg(2, "tb1qproxy.w2", 10_000_000.0, 4);
+        let ext_result = handle
+            .open_extended_channel(
+                downstream_id,
+                ext_msg,
+                "tb1qproxy".to_string(),
+                Some("w2".to_string()),
+                11,
+            )
+            .await
+            .unwrap();
+
+        // Different channel IDs
+        assert_ne!(std_result.channel.channel_id, ext_result.channel.channel_id);
+
+        // Different extranonce prefixes
+        assert_ne!(
+            std_result.channel.extranonce_prefix,
+            ext_result.channel.extranonce_prefix
+        );
+
+        // Total count includes both
+        assert_eq!(handle.get_count().await.unwrap(), 2);
+
+        // Can look up each type independently
+        assert!(
+            handle
+                .get_channel(std_result.channel.channel_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            handle
+                .get_extended_channel(ext_result.channel.channel_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Standard channel not found in extended lookup (and vice versa)
+        assert!(
+            handle
+                .get_extended_channel(std_result.channel.channel_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            handle
+                .get_channel(ext_result.channel.channel_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_downstream_cleans_extended_channels() {
+        let handle = start_channel_manager(0, default_test_target());
+        let downstream_id: DownstreamId = 300;
+
+        // Open one standard and one extended
+        let std_msg = make_open_channel_msg(1, "tb1q1", 100.0);
+        handle
+            .open_standard_channel(downstream_id, std_msg, "tb1q1".to_string(), None, 1)
+            .await
+            .unwrap();
+
+        let ext_msg = make_open_extended_channel_msg(2, "tb1q2", 100.0, 4);
+        handle
+            .open_extended_channel(downstream_id, ext_msg, "tb1q2".to_string(), None, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(handle.get_count().await.unwrap(), 2);
+
+        // Remove downstream — both should be cleaned up
+        handle.remove_downstream(downstream_id).await.unwrap();
+        assert_eq!(handle.get_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extended_channel_extranonce_uniqueness() {
+        let handle = start_channel_manager(42, default_test_target());
+
+        let mut prefixes = Vec::new();
+        for i in 0..10 {
+            let msg = make_open_extended_channel_msg(i, &format!("tb1q{i}"), 100.0, 4);
+            let result = handle
+                .open_extended_channel(800 + i as u64, msg, format!("tb1q{i}"), None, i as u64)
+                .await
+                .unwrap();
+            prefixes.push(result.channel.extranonce_prefix.clone());
+        }
+
+        // All prefixes should be unique
+        let unique_count = {
+            let mut sorted = prefixes.clone();
+            sorted.sort();
+            sorted.dedup();
+            sorted.len()
+        };
+        assert_eq!(unique_count, prefixes.len());
+
+        // All prefixes should start with server_id = 42 and be 6 bytes
+        for prefix in &prefixes {
+            assert_eq!(prefix.len(), EXTRANONCE_PREFIX_SIZE);
+            assert_eq!(&prefix[0..2], &42u16.to_be_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_extended_channels_for_downstream() {
+        let handle = start_channel_manager(0, default_test_target());
+        let downstream_id: DownstreamId = 900;
+
+        // No extended channels yet
+        let ids = handle
+            .get_extended_channels_for_downstream(downstream_id)
+            .await
+            .unwrap();
+        assert!(ids.is_empty());
+
+        // Open two extended channels
+        let msg1 = make_open_extended_channel_msg(1, "tb1qa", 100.0, 4);
+        let r1 = handle
+            .open_extended_channel(downstream_id, msg1, "tb1qa".to_string(), None, 1)
+            .await
+            .unwrap();
+
+        let msg2 = make_open_extended_channel_msg(2, "tb1qb", 200.0, 4);
+        let r2 = handle
+            .open_extended_channel(downstream_id, msg2, "tb1qb".to_string(), None, 2)
+            .await
+            .unwrap();
+
+        let ids = handle
+            .get_extended_channels_for_downstream(downstream_id)
+            .await
+            .unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&r1.channel.channel_id));
+        assert!(ids.contains(&r2.channel.channel_id));
+    }
+
+    #[tokio::test]
+    async fn test_update_target_works_for_extended_channels() {
+        let handle = start_channel_manager(0, default_test_target());
+
+        let msg = make_open_extended_channel_msg(1, "tb1qproxy", 100.0, 4);
+        let result = handle
+            .open_extended_channel(100, msg, "tb1qproxy".to_string(), None, 1)
+            .await
+            .unwrap();
+
+        let new_target = [0x00; 32];
+        let updated = handle
+            .update_target(result.channel.channel_id, new_target)
+            .await
+            .unwrap();
+        assert!(updated);
+
+        // Verify the target was updated
+        let ch = handle
+            .get_extended_channel(result.channel.channel_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ch.target, new_target);
     }
 }
