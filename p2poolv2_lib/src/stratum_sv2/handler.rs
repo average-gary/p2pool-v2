@@ -24,7 +24,7 @@
 //! 3. Runs a reader loop that decrypts inbound frames, dispatches messages
 //!    (SetupConnection, OpenStandardMiningChannel, SubmitSharesStandard)
 //! 4. Spawns a writer task that encrypts outbound frames (server pushes like
-//!    NewMiningJob, SetNewPrevHash) and responses routed through the
+//!    SetNewPrevHash, NewMiningJob) and responses routed through the
 //!    connection registry
 //! 5. Cleans up channels and registry entries on disconnect
 
@@ -420,7 +420,25 @@ async fn handle_open_standard_channel(
     }
 
     // Bootstrap: send the current active job to this channel.
+    // SetNewPrevHash is sent before NewMiningJob so downstream clients
+    // have the block context before receiving a non-future job.
     if let Ok(Some(active)) = ctx.job_distributor.get_active_job(group_channel_id).await {
+        // Send SetNewPrevHash first if the job is activated (not future).
+        if let (Some(prev_hash), Some(nbits)) = (active.prev_hash, active.nbits) {
+            let prev_hash_msg = SetNewPrevHash {
+                channel_id,
+                job_id: active.job_id,
+                prev_hash: prev_hash
+                    .to_vec()
+                    .try_into()
+                    .expect("32 bytes is valid U256"),
+                min_ntime: active.min_ntime,
+                nbits,
+            };
+            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+        }
+
         // Send NewMiningJob.
         let job_msg = NewMiningJob {
             channel_id,
@@ -439,22 +457,6 @@ async fn handle_open_standard_channel(
         };
         let any = AnyMessage::Mining(Mining::NewMiningJob(job_msg));
         send_message(state, &ctx.connections, session.downstream_id, any).await?;
-
-        // Send SetNewPrevHash if the job is activated (not future).
-        if let (Some(prev_hash), Some(nbits)) = (active.prev_hash, active.nbits) {
-            let prev_hash_msg = SetNewPrevHash {
-                channel_id,
-                job_id: active.job_id,
-                prev_hash: prev_hash
-                    .to_vec()
-                    .try_into()
-                    .expect("32 bytes is valid U256"),
-                min_ntime: active.min_ntime,
-                nbits,
-            };
-            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
-            send_message(state, &ctx.connections, session.downstream_id, any).await?;
-        }
     }
 
     // Initialize a difficulty adjuster for this channel.
@@ -661,6 +663,35 @@ async fn writer_task(
                 }
                 let event = job_events.borrow_and_update().clone();
                 if let Some(event) = event {
+                    // Send SetNewPrevHash before NewMiningJob so downstream
+                    // clients have block context before receiving a non-future job.
+
+                    // If the job is activated (not future), send SetNewPrevHash first.
+                    if let Some(prev_hash) = event.job_state.prev_hash {
+                        let prev_hash_msg = SetNewPrevHash {
+                            channel_id: event.group_channel_id,
+                            job_id: event.job_id,
+                            prev_hash: prev_hash
+                                .to_vec()
+                                .try_into()
+                                .expect("32 bytes is valid U256"),
+                            min_ntime: event.job_state.min_ntime,
+                            nbits: event.job_state.nbits,
+                        };
+                        let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+                        match encode_message(&state, any_prev).await {
+                            Ok(bytes) => {
+                                if let Err(e) = writer.write_all(&bytes).await {
+                                    debug!(downstream_id, "SV2 write prev_hash failed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
+                            }
+                        }
+                    }
+
                     // Encode and write NewMiningJob.
                     // The event.group_channel_id tells us which group this is for.
                     // We use channel_id 0 (group broadcast) for group-level messages.
@@ -689,32 +720,6 @@ async fn writer_task(
                         }
                         Err(e) => {
                             warn!(downstream_id, "failed to encode NewMiningJob: {e}");
-                        }
-                    }
-
-                    // If the job is activated (not future), send SetNewPrevHash.
-                    if let Some(prev_hash) = event.job_state.prev_hash {
-                        let prev_hash_msg = SetNewPrevHash {
-                            channel_id: event.group_channel_id,
-                            job_id: event.job_id,
-                            prev_hash: prev_hash
-                                .to_vec()
-                                .try_into()
-                                .expect("32 bytes is valid U256"),
-                            min_ntime: event.job_state.min_ntime,
-                            nbits: event.job_state.nbits,
-                        };
-                        let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
-                        match encode_message(&state, any_prev).await {
-                            Ok(bytes) => {
-                                if let Err(e) = writer.write_all(&bytes).await {
-                                    debug!(downstream_id, "SV2 write prev_hash failed: {e}");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
-                            }
                         }
                     }
                 }
