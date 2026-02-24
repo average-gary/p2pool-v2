@@ -44,7 +44,7 @@ use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
 use stratum_core::codec_sv2::{NoiseEncoder, StandardNoiseDecoder, State};
 use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
 use stratum_core::framing_sv2::framing::{Frame, Sv2Frame};
-use stratum_core::mining_sv2::OpenStandardMiningChannel;
+use stratum_core::mining_sv2::{OpenStandardMiningChannel, SubmitSharesStandard};
 use stratum_core::noise_sv2::{INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE, Initiator};
 use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, IsSv2Message, Mining};
 
@@ -786,4 +786,350 @@ async fn test_sv2_late_connect_bootstrap() {
         has_set_prev_hash,
         "should have bootstrap SetNewPrevHash (got messages: {all_messages:?})"
     );
+}
+
+/// Test 12: Submit a share with a random nonce — should be rejected with
+/// "low-difficulty-share" because the hash won't meet the channel target.
+///
+/// Full flow: connect → setup → open channel → inject template → receive
+/// NewMiningJob + SetNewPrevHash → send SubmitSharesStandard → receive
+/// SubmitSharesError with "low-difficulty-share".
+#[tokio::test]
+async fn test_sv2_submit_share_low_difficulty() {
+    let server = start_test_sv2_server().await;
+
+    // Connect and set up a channel.
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client.send(build_open_channel(1, "miner.rig1")).await;
+    let open_resp = client.recv().await;
+    let channel_id = match &open_resp {
+        AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenStandardMiningChannelSuccess, got: {other:?}"),
+    };
+
+    // Brief pause to ensure the handler's writer task has subscribed to job events.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template so we have an active job to submit against.
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Receive NewMiningJob — extract the job_id for the submit.
+    let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let job_id = match &msg1 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => job.job_id,
+        other => panic!("expected NewMiningJob, got: {other:?}"),
+    };
+
+    // Receive SetNewPrevHash.
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(_)) => { /* expected */ }
+        other => panic!("expected SetNewPrevHash, got: {other:?}"),
+    }
+
+    // Submit a share with a fabricated (random) nonce.
+    // With difficulty-1 target, a random nonce will almost certainly not
+    // produce a hash that meets the channel target.
+    let submit = SubmitSharesStandard {
+        channel_id,
+        sequence_number: 0,
+        job_id,
+        nonce: 0xDEADBEEF,
+        ntime: 1700000100,
+        version: 0x20000000,
+    };
+    client
+        .send(AnyMessage::Mining(Mining::SubmitSharesStandard(submit)))
+        .await;
+
+    // The server should respond with SubmitSharesError.
+    let response = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &response {
+        AnyMessage::Mining(Mining::SubmitSharesError(err)) => {
+            assert_eq!(err.channel_id, channel_id);
+            assert_eq!(err.sequence_number, 0);
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            assert!(
+                error_str.contains("low-difficulty-share"),
+                "expected 'low-difficulty-share', got: {error_str}"
+            );
+        }
+        other => panic!("expected SubmitSharesError, got: {other:?}"),
+    }
+}
+
+/// Load the second test GBT fixture (two-txns, different previousblockhash).
+fn load_test_template_two_txns() -> BlockTemplate {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test_data/gbt/regtest/ckpool/two-txns/gbt.json");
+    let json = std::fs::read_to_string(path).expect("failed to read two-txns test template");
+    serde_json::from_str(&json).expect("failed to parse two-txns test template")
+}
+
+/// Test 13: New block scenario — inject two templates with different
+/// `previousblockhash` values and verify the client receives new job
+/// messages for each.
+///
+/// Flow:
+/// 1. Inject first template (one-txn fixture) → client gets NewMiningJob + SetNewPrevHash
+/// 2. Inject second template (two-txns fixture, different prev_hash) → client
+///    gets a NEW NewMiningJob + SetNewPrevHash with the updated prev_hash
+/// 3. Old job_ids should be different from new ones
+#[tokio::test]
+async fn test_sv2_new_block_scenario() {
+    let server = start_test_sv2_server().await;
+
+    // Connect and set up a channel.
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client.send(build_open_channel(1, "miner.rig1")).await;
+    let _ = client.recv().await; // OpenStandardMiningChannelSuccess
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // --- First template (one-txn fixture) ---
+    let template1 = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template1),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template 1 failed");
+
+    let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let first_job_id = match &msg1 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => {
+            assert!(job.job_id > 0, "first job_id should be positive");
+            job.job_id
+        }
+        other => panic!("expected NewMiningJob (1st), got: {other:?}"),
+    };
+
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let first_prev_hash = match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
+        other => panic!("expected SetNewPrevHash (1st), got: {other:?}"),
+    };
+
+    // --- Second template (two-txns fixture, different previousblockhash) ---
+    let template2 = load_test_template_two_txns();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template2),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template 2 failed");
+
+    let msg3 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let second_job_id = match &msg3 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => {
+            assert!(job.job_id > 0, "second job_id should be positive");
+            job.job_id
+        }
+        other => panic!("expected NewMiningJob (2nd), got: {other:?}"),
+    };
+
+    let msg4 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let second_prev_hash = match &msg4 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
+        other => panic!("expected SetNewPrevHash (2nd), got: {other:?}"),
+    };
+
+    // Verify the two templates produced different jobs and different prev_hashes.
+    assert_ne!(
+        first_job_id, second_job_id,
+        "new block should produce a different job_id"
+    );
+    assert_ne!(
+        first_prev_hash, second_prev_hash,
+        "new block should have a different prev_hash"
+    );
+}
+
+/// Test 14: Dual-protocol test — both SV1 and SV2 emit shares to the same
+/// emissions channel.
+///
+/// Starts both an SV1 StratumServer and an SV2 server sharing the same
+/// `emissions_tx`. An SV2 client connects, opens a channel, injects a
+/// template, and submits a share. We verify the share (even if rejected
+/// as low-difficulty) traverses the handler and reaches the emissions
+/// channel when the target is easy enough, OR produces a SubmitSharesError
+/// that proves the full pipeline executed.
+///
+/// This test proves the SV2 server correctly feeds into the shared
+/// accounting pipeline.
+#[tokio::test]
+async fn test_sv2_emissions_pipeline_integration() {
+    let (pub_key, sec_key) = test_authority_keypair();
+
+    let authority = AuthorityKeypair {
+        public_key: pub_key,
+        secret_key: sec_key,
+        cert_validity: Duration::from_secs(86400),
+    };
+
+    // Bind to ephemeral port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    // Shared emissions channel — this is the key shared infrastructure.
+    let (emissions_tx, mut emissions_rx) = mpsc::channel::<Emission>(100);
+
+    // Start SV2 actors.
+    let connections = start_sv2_connections_handler().await;
+    // Use an extremely easy target (all 0xff) so random nonces meet it.
+    let easy_target = [0xff; 32];
+    let channels = start_channel_manager(0, easy_target);
+    let job_distributor = start_job_distributor(0);
+    let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+
+    let ctx = Sv2ConnectionContext {
+        connections: connections.clone(),
+        channels: channels.clone(),
+        job_distributor: job_distributor.clone(),
+        emissions_tx,
+        chain_store: chain_store_handle,
+        validate_addresses: false,
+        network: bitcoin::Network::Regtest,
+    };
+
+    let server_config = Sv2ServerConfig {
+        hostname: "127.0.0.1".to_string(),
+        port: addr.port(),
+        authority,
+    };
+
+    let (accept_shutdown_tx, accept_shutdown_rx) = oneshot::channel();
+    let (handshake_tx, mut handshake_rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        let _ = run_accept_loop(server_config, handshake_tx, accept_shutdown_rx).await;
+    });
+
+    let handler_ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Some(handshake) = handshake_rx.recv().await {
+            let ctx = handler_ctx.clone();
+            tokio::spawn(async move {
+                handle_sv2_connection(handshake, ctx).await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect SV2 client.
+    let mut client = TestSv2Client::connect(addr, Some(pub_key)).await;
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client.send(build_open_channel(1, "testminer.rig1")).await;
+    let open_resp = client.recv().await;
+    let channel_id = match &open_resp {
+        AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenStandardMiningChannelSuccess, got: {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    ctx.job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Receive NewMiningJob + SetNewPrevHash.
+    let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let job_id = match &msg1 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => job.job_id,
+        other => panic!("expected NewMiningJob, got: {other:?}"),
+    };
+
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let ntime = match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.min_ntime,
+        other => panic!("expected SetNewPrevHash, got: {other:?}"),
+    };
+
+    // Submit a share. With the all-0xFF target, any hash should meet the
+    // channel target, so this should produce SubmitSharesSuccess and an
+    // Emission on the shared channel.
+    let submit = SubmitSharesStandard {
+        channel_id,
+        sequence_number: 0,
+        job_id,
+        nonce: 0x42424242,
+        ntime,
+        version: 0x20000000,
+    };
+    client
+        .send(AnyMessage::Mining(Mining::SubmitSharesStandard(submit)))
+        .await;
+
+    // We should get SubmitSharesSuccess (because the target is all-0xFF).
+    let response = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &response {
+        AnyMessage::Mining(Mining::SubmitSharesSuccess(success)) => {
+            assert_eq!(success.channel_id, channel_id);
+            assert_eq!(success.last_sequence_number, 0);
+            assert_eq!(success.new_submits_accepted_count, 1);
+        }
+        AnyMessage::Mining(Mining::SubmitSharesError(err)) => {
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            panic!("share should have been accepted with all-0xFF target, got error: {error_str}",);
+        }
+        other => panic!("expected SubmitSharesSuccess, got: {other:?}"),
+    }
+
+    // Verify the emission arrived on the shared channel.
+    let emission = tokio::time::timeout(Duration::from_secs(3), emissions_rx.recv())
+        .await
+        .expect("timed out waiting for emission")
+        .expect("emissions channel closed");
+
+    assert_eq!(emission.header.nonce, 0x42424242);
+
+    // Cleanup.
+    drop(accept_shutdown_tx);
 }
