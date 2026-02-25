@@ -44,7 +44,10 @@ use p2poolv2_lib::test_utils::setup_test_chain_store_handle;
 use stratum_core::codec_sv2::{NoiseEncoder, StandardNoiseDecoder, State};
 use stratum_core::common_messages_sv2::{Protocol, SetupConnection};
 use stratum_core::framing_sv2::framing::{Frame, Sv2Frame};
-use stratum_core::mining_sv2::{OpenStandardMiningChannel, SubmitSharesStandard};
+use stratum_core::mining_sv2::{
+    OpenExtendedMiningChannel, OpenStandardMiningChannel, SubmitSharesExtended,
+    SubmitSharesStandard,
+};
 use stratum_core::noise_sv2::{INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE, Initiator};
 use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, IsSv2Message, Mining};
 
@@ -360,6 +363,25 @@ fn build_open_channel(request_id: u32, user_identity: &str) -> AnyMessage<'stati
             .expect("valid U256"),
     };
     AnyMessage::Mining(Mining::OpenStandardMiningChannel(open))
+}
+
+/// Build an OpenExtendedMiningChannel message.
+fn build_open_extended_channel(
+    request_id: u32,
+    user_identity: &str,
+    min_extranonce_size: u16,
+) -> AnyMessage<'static> {
+    let open = OpenExtendedMiningChannel {
+        request_id,
+        user_identity: user_identity.to_string().try_into().expect("valid Str0255"),
+        nominal_hash_rate: 10_000_000.0, // 10 MH/s (proxy-like)
+        max_target: difficulty_to_target(1)
+            .to_vec()
+            .try_into()
+            .expect("valid U256"),
+        min_extranonce_size,
+    };
+    AnyMessage::Mining(Mining::OpenExtendedMiningChannel(open))
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,4 +1154,716 @@ async fn test_sv2_emissions_pipeline_integration() {
 
     // Cleanup.
     drop(accept_shutdown_tx);
+}
+
+// ===========================================================================
+// Extended Mining Channel integration tests
+// ===========================================================================
+
+/// Test 15: Open an extended mining channel — basic lifecycle.
+///
+/// Flow: connect → setup → OpenExtendedMiningChannel →
+/// OpenExtendedMiningChannelSuccess with correct extranonce_size and prefix.
+#[tokio::test]
+async fn test_sv2_open_extended_channel() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    // Setup.
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    // Open extended channel.
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+
+    let response = client.recv().await;
+    match &response {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(success)) => {
+            assert_eq!(success.request_id, 1, "request_id should match");
+            assert!(success.channel_id > 0, "channel_id should be positive");
+            assert_eq!(
+                success.extranonce_size, 6,
+                "extranonce_size should be 6 (proxy search space)"
+            );
+            // extranonce_prefix should be 6 bytes
+            assert_eq!(
+                success.extranonce_prefix.inner_as_ref().len(),
+                6,
+                "extranonce_prefix should be 6 bytes"
+            );
+        }
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    }
+}
+
+/// Test 16: Extended channel with no active job — no bootstrap messages sent.
+#[tokio::test]
+async fn test_sv2_extended_channel_no_bootstrap_without_job() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+
+    let response = client.recv().await;
+    match &response {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(_)) => { /* expected */ }
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    }
+
+    // No jobs injected, so there should be no further messages.
+    let extra = client.try_recv(Duration::from_millis(200)).await;
+    assert!(
+        extra.is_none(),
+        "expected no bootstrap messages when no template exists, got: {extra:?}"
+    );
+}
+
+/// Test 17: Inject a template and verify an extended channel receives
+/// NewExtendedMiningJob with merkle_path + coinbase prefix/suffix,
+/// preceded by SetNewPrevHash.
+#[tokio::test]
+async fn test_sv2_extended_channel_job_distribution() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+    let open_resp = client.recv().await;
+    let channel_id = match &open_resp {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    };
+
+    // Brief pause for writer task subscription.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Collect messages flexibly — order may vary due to writer task scheduling.
+    // We expect: SetNewPrevHash (for group), NewMiningJob (for group),
+    // SetNewPrevHash (for extended), NewExtendedMiningJob (for extended).
+    let mut messages = Vec::new();
+    for _ in 0..6 {
+        match client.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => messages.push(msg),
+            None => break,
+        }
+    }
+
+    let has_set_prev_hash = messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::SetNewPrevHash(_))));
+    let has_ext_job = messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::NewExtendedMiningJob(_))));
+
+    assert!(
+        has_set_prev_hash,
+        "should have received SetNewPrevHash (got: {messages:?})"
+    );
+    assert!(
+        has_ext_job,
+        "should have received NewExtendedMiningJob (got: {messages:?})"
+    );
+
+    // Verify the extended job has the expected fields.
+    let ext_job = messages.iter().find_map(|m| match m {
+        AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => Some(j),
+        _ => None,
+    });
+    let ext_job = ext_job.expect("NewExtendedMiningJob not found");
+    assert_eq!(ext_job.channel_id, channel_id);
+    assert!(ext_job.job_id > 0);
+    assert!(
+        !ext_job.coinbase_tx_prefix.inner_as_ref().is_empty(),
+        "coinbase_tx_prefix should be non-empty"
+    );
+    assert!(
+        !ext_job.coinbase_tx_suffix.inner_as_ref().is_empty(),
+        "coinbase_tx_suffix should be non-empty"
+    );
+}
+
+/// Test 18: Late-connecting extended channel client gets bootstrap job.
+#[tokio::test]
+async fn test_sv2_extended_channel_late_connect_bootstrap() {
+    let server = start_test_sv2_server().await;
+
+    // Client 1: standard channel to ensure a template is injected and processed.
+    let mut client1 = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+    client1.send(build_setup_connection()).await;
+    let _ = client1.recv().await;
+    client1.send(build_open_channel(1, "miner1.rig1")).await;
+    let _ = client1.recv().await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Drain client1's job messages.
+    let _ = client1.recv_with_timeout(Duration::from_secs(3)).await;
+    let _ = client1.recv_with_timeout(Duration::from_secs(3)).await;
+
+    // Now connect client 2 with an extended channel — should get bootstrapped.
+    let mut client2 = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+    client2.send(build_setup_connection()).await;
+
+    let mut all_messages = Vec::new();
+    let msg = client2.recv_with_timeout(Duration::from_secs(3)).await;
+    all_messages.push(msg); // SetupConnectionSuccess
+
+    client2
+        .send(build_open_extended_channel(1, "proxy2.rig1", 6))
+        .await;
+
+    // Collect messages (OpenExtendedMiningChannelSuccess + bootstrap).
+    for _ in 0..5 {
+        match client2.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => all_messages.push(msg),
+            None => break,
+        }
+    }
+
+    let has_open_success = all_messages.iter().any(|m| {
+        matches!(
+            m,
+            AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(_))
+        )
+    });
+    let has_ext_job = all_messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::NewExtendedMiningJob(_))));
+    let has_prev_hash = all_messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::SetNewPrevHash(_))));
+
+    assert!(
+        has_open_success,
+        "should have OpenExtendedMiningChannelSuccess"
+    );
+    assert!(
+        has_ext_job,
+        "should have bootstrap NewExtendedMiningJob (got: {all_messages:?})"
+    );
+    assert!(
+        has_prev_hash,
+        "should have bootstrap SetNewPrevHash (got: {all_messages:?})"
+    );
+}
+
+/// Test 19: Submit an extended share with an easy target (all-0xFF) —
+/// should produce SubmitSharesSuccess and an Emission.
+#[tokio::test]
+async fn test_sv2_submit_extended_share_easy_target() {
+    let (pub_key, sec_key) = test_authority_keypair();
+
+    let authority = AuthorityKeypair {
+        public_key: pub_key,
+        secret_key: sec_key,
+        cert_validity: Duration::from_secs(86400),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind failed");
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let (emissions_tx, mut emissions_rx) = mpsc::channel::<Emission>(100);
+
+    let connections = start_sv2_connections_handler().await;
+    let easy_target = [0xff; 32];
+    let channels = start_channel_manager(0, easy_target);
+    let job_distributor = start_job_distributor(0);
+    let (chain_store_handle, _temp_dir) = setup_test_chain_store_handle(true).await;
+
+    let ctx = Sv2ConnectionContext {
+        connections: connections.clone(),
+        channels: channels.clone(),
+        job_distributor: job_distributor.clone(),
+        emissions_tx,
+        chain_store: chain_store_handle,
+        validate_addresses: false,
+        network: bitcoin::Network::Regtest,
+    };
+
+    let server_config = Sv2ServerConfig {
+        hostname: "127.0.0.1".to_string(),
+        port: addr.port(),
+        authority,
+    };
+
+    let (accept_shutdown_tx, accept_shutdown_rx) = oneshot::channel();
+    let (handshake_tx, mut handshake_rx) = mpsc::channel(32);
+
+    tokio::spawn(async move {
+        let _ = run_accept_loop(server_config, handshake_tx, accept_shutdown_rx).await;
+    });
+
+    let handler_ctx = ctx.clone();
+    tokio::spawn(async move {
+        while let Some(handshake) = handshake_rx.recv().await {
+            let ctx = handler_ctx.clone();
+            tokio::spawn(async move {
+                handle_sv2_connection(handshake, ctx).await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Connect and open extended channel.
+    let mut client = TestSv2Client::connect(addr, Some(pub_key)).await;
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+    let open_resp = client.recv().await;
+    let (channel_id, extranonce_prefix) = match &open_resp {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => {
+            (s.channel_id, s.extranonce_prefix.inner_as_ref().to_vec())
+        }
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    ctx.job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Collect messages — we need SetNewPrevHash and NewExtendedMiningJob.
+    let mut messages = Vec::new();
+    for _ in 0..6 {
+        match client.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => messages.push(msg),
+            None => break,
+        }
+    }
+
+    // Find the extended job to extract job_id and ntime.
+    let ext_job = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => Some(j),
+            _ => None,
+        })
+        .expect("should have received NewExtendedMiningJob");
+
+    let job_id = ext_job.job_id;
+
+    // Find SetNewPrevHash for ntime.
+    let prev_hash_msg = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => Some(ph),
+            _ => None,
+        })
+        .expect("should have received SetNewPrevHash");
+    let ntime = prev_hash_msg.min_ntime;
+
+    // Build the proxy extranonce (6 bytes).
+    let proxy_extranonce: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+    // Submit an extended share.
+    let submit = SubmitSharesExtended {
+        channel_id,
+        sequence_number: 0,
+        job_id,
+        nonce: 0x42424242,
+        ntime,
+        version: 0x20000000,
+        extranonce: proxy_extranonce.try_into().expect("valid B032"),
+    };
+    client
+        .send(AnyMessage::Mining(Mining::SubmitSharesExtended(submit)))
+        .await;
+
+    // Should get SubmitSharesSuccess (easy target).
+    let response = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &response {
+        AnyMessage::Mining(Mining::SubmitSharesSuccess(success)) => {
+            assert_eq!(success.channel_id, channel_id);
+            assert_eq!(success.last_sequence_number, 0);
+            assert_eq!(success.new_submits_accepted_count, 1);
+        }
+        AnyMessage::Mining(Mining::SubmitSharesError(err)) => {
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            panic!("share should have been accepted with all-0xFF target, got error: {error_str}");
+        }
+        other => panic!("expected SubmitSharesSuccess, got: {other:?}"),
+    }
+
+    // Verify the emission arrived on the shared channel.
+    let emission = tokio::time::timeout(Duration::from_secs(3), emissions_rx.recv())
+        .await
+        .expect("timed out waiting for emission")
+        .expect("emissions channel closed");
+
+    assert_eq!(emission.header.nonce, 0x42424242);
+
+    // Verify the extranonce in the pplns share contains both prefix + proxy extranonce.
+    let expected_full_extranonce = {
+        let mut v = extranonce_prefix.clone();
+        v.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
+        hex::encode(v)
+    };
+    assert_eq!(
+        emission.pplns.extranonce2, expected_full_extranonce,
+        "emission should contain full extranonce (prefix + proxy)"
+    );
+
+    drop(accept_shutdown_tx);
+}
+
+/// Test 20: Submit extended share with wrong extranonce size — should
+/// be rejected with "invalid-extranonce".
+#[tokio::test]
+async fn test_sv2_submit_extended_share_wrong_extranonce_size() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+    let open_resp = client.recv().await;
+    let channel_id = match &open_resp {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Collect messages to get job_id.
+    let mut messages = Vec::new();
+    for _ in 0..6 {
+        match client.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => messages.push(msg),
+            None => break,
+        }
+    }
+
+    let ext_job = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => Some(j),
+            _ => None,
+        })
+        .expect("should have received NewExtendedMiningJob");
+    let job_id = ext_job.job_id;
+
+    let prev_hash_msg = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => Some(ph),
+            _ => None,
+        })
+        .expect("should have received SetNewPrevHash");
+    let ntime = prev_hash_msg.min_ntime;
+
+    // Submit with 4-byte extranonce (expected 6).
+    let wrong_extranonce: Vec<u8> = vec![0xAA, 0xBB, 0xCC, 0xDD];
+    let submit = SubmitSharesExtended {
+        channel_id,
+        sequence_number: 0,
+        job_id,
+        nonce: 0xDEADBEEF,
+        ntime,
+        version: 0x20000000,
+        extranonce: wrong_extranonce.try_into().expect("valid B032"),
+    };
+    client
+        .send(AnyMessage::Mining(Mining::SubmitSharesExtended(submit)))
+        .await;
+
+    // Should get SubmitSharesError with "invalid-extranonce".
+    let response = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &response {
+        AnyMessage::Mining(Mining::SubmitSharesError(err)) => {
+            assert_eq!(err.channel_id, channel_id);
+            assert_eq!(err.sequence_number, 0);
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            assert!(
+                error_str.contains("invalid-extranonce"),
+                "expected 'invalid-extranonce', got: {error_str}"
+            );
+        }
+        other => panic!("expected SubmitSharesError, got: {other:?}"),
+    }
+}
+
+/// Test 21: Extended share with random nonce against difficulty-1 target —
+/// should be rejected as "low-difficulty-share".
+#[tokio::test]
+async fn test_sv2_submit_extended_share_low_difficulty() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 6))
+        .await;
+    let open_resp = client.recv().await;
+    let channel_id = match &open_resp {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    let mut messages = Vec::new();
+    for _ in 0..6 {
+        match client.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => messages.push(msg),
+            None => break,
+        }
+    }
+
+    let ext_job = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::NewExtendedMiningJob(j)) => Some(j),
+            _ => None,
+        })
+        .expect("should have received NewExtendedMiningJob");
+    let job_id = ext_job.job_id;
+
+    let prev_hash_msg = messages
+        .iter()
+        .find_map(|m| match m {
+            AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => Some(ph),
+            _ => None,
+        })
+        .expect("should have received SetNewPrevHash");
+    let ntime = prev_hash_msg.min_ntime;
+
+    // Submit with correct 6-byte extranonce but difficulty-1 target.
+    let extranonce: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let submit = SubmitSharesExtended {
+        channel_id,
+        sequence_number: 0,
+        job_id,
+        nonce: 0xDEADBEEF,
+        ntime,
+        version: 0x20000000,
+        extranonce: extranonce.try_into().expect("valid B032"),
+    };
+    client
+        .send(AnyMessage::Mining(Mining::SubmitSharesExtended(submit)))
+        .await;
+
+    let response = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &response {
+        AnyMessage::Mining(Mining::SubmitSharesError(err)) => {
+            assert_eq!(err.channel_id, channel_id);
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            assert!(
+                error_str.contains("low-difficulty-share"),
+                "expected 'low-difficulty-share', got: {error_str}"
+            );
+        }
+        other => panic!("expected SubmitSharesError, got: {other:?}"),
+    }
+}
+
+/// Test 22: Mixed standard + extended channels on the same connection.
+///
+/// Open both a standard and an extended channel on the same connection.
+/// Inject a template and verify the client receives both NewMiningJob (for
+/// the standard channel's group) and NewExtendedMiningJob (for the extended
+/// channel).
+#[tokio::test]
+async fn test_sv2_mixed_standard_and_extended_channels() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    // Open standard channel.
+    client.send(build_open_channel(1, "miner.rig1")).await;
+    let std_resp = client.recv().await;
+    let std_channel_id = match &std_resp {
+        AnyMessage::Mining(Mining::OpenStandardMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenStandardMiningChannelSuccess, got: {other:?}"),
+    };
+
+    // Open extended channel on the same connection.
+    client
+        .send(build_open_extended_channel(2, "proxy.rig2", 6))
+        .await;
+    let ext_resp = client.recv().await;
+    let ext_channel_id = match &ext_resp {
+        AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)) => s.channel_id,
+        other => panic!("expected OpenExtendedMiningChannelSuccess, got: {other:?}"),
+    };
+
+    // Standard and extended channels should have different IDs.
+    assert_ne!(
+        std_channel_id, ext_channel_id,
+        "standard and extended channels should have different IDs"
+    );
+
+    // Brief pause for writer task subscription.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Inject a template.
+    let template = load_test_template();
+    server
+        .ctx
+        .job_distributor
+        .new_template(
+            Arc::new(template),
+            test_output_distribution(),
+            b"p2pool-test".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .expect("new_template failed");
+
+    // Collect all messages.
+    let mut messages = Vec::new();
+    for _ in 0..8 {
+        match client.try_recv(Duration::from_millis(500)).await {
+            Some(msg) => messages.push(msg),
+            None => break,
+        }
+    }
+
+    // Should have both NewMiningJob (for standard group) and NewExtendedMiningJob.
+    let has_new_mining_job = messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::NewMiningJob(_))));
+    let has_ext_mining_job = messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::NewExtendedMiningJob(_))));
+    let has_set_prev_hash = messages
+        .iter()
+        .any(|m| matches!(m, AnyMessage::Mining(Mining::SetNewPrevHash(_))));
+
+    assert!(
+        has_new_mining_job,
+        "should have NewMiningJob for standard channel (got: {messages:?})"
+    );
+    assert!(
+        has_ext_mining_job,
+        "should have NewExtendedMiningJob for extended channel (got: {messages:?})"
+    );
+    assert!(
+        has_set_prev_hash,
+        "should have SetNewPrevHash (got: {messages:?})"
+    );
+}
+
+/// Test 23: Extended channel with min_extranonce_size too large — should
+/// be rejected.
+#[tokio::test]
+async fn test_sv2_extended_channel_extranonce_too_large() {
+    let server = start_test_sv2_server().await;
+    let mut client = TestSv2Client::connect(server.addr, Some(server.authority_pubkey)).await;
+
+    client.send(build_setup_connection()).await;
+    let _ = client.recv().await; // SetupConnectionSuccess
+
+    // Request min_extranonce_size = 10, which exceeds the 6-byte proxy space.
+    client
+        .send(build_open_extended_channel(1, "proxy.rig1", 10))
+        .await;
+
+    let response = client.recv().await;
+    match &response {
+        AnyMessage::Mining(Mining::OpenMiningChannelError(err)) => {
+            // Expected — the pool should reject the oversized extranonce request.
+            let error_bytes = err.error_code.inner_as_ref();
+            let error_str = std::str::from_utf8(error_bytes).unwrap_or("<non-utf8>");
+            assert!(!error_str.is_empty(), "error code should not be empty");
+        }
+        other => panic!("expected OpenMiningChannelError, got: {other:?}"),
+    }
 }
