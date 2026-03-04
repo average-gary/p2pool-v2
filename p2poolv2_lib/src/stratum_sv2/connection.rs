@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use key_utils::{Secp256k1PublicKey, Secp256k1SecretKey};
 use stratum_core::codec_sv2::{HandshakeRole, State};
 use stratum_core::noise_sv2::{self, Responder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -57,36 +58,71 @@ pub struct AuthorityKeypair {
 }
 
 impl AuthorityKeypair {
-    /// Parse from hex-encoded config strings.
+    /// Parse authority keys from SRI Base58Check format (preferred) or hex fallback.
+    ///
+    /// SRI Base58Check format is the standard key encoding used across the
+    /// Stratum V2 Reference Implementation (SRI) ecosystem, defined by the
+    /// `key-utils` crate. Using this format means config values are directly
+    /// copy-pasteable between hydrapool and SRI tools (translator, pool, etc.).
+    ///
+    /// # SRI default keypair (for testing/development)
+    ///
+    /// ```text
+    /// authority_public_key = "9auqWEzQDVyd2oe1JVGFLMLHZtCo2FFqZwtKA5gd9xbuEu7PH72"
+    /// authority_secret_key = "mkDLTBBRxdBv998612qipDYoTK3YUrqLe8uWw7gu3iXbSrn2n"
+    /// ```
     pub fn from_config(
-        public_key_hex: &str,
-        secret_key_hex: &str,
+        public_key_str: &str,
+        secret_key_str: &str,
         cert_validity_secs: u64,
     ) -> Result<Self, Sv2Error> {
-        let public_key: [u8; 32] = hex::decode(public_key_hex)
-            .map_err(|e| Sv2Error::Config(format!("invalid authority public key hex: {e}")))?
-            .try_into()
-            .map_err(|v: Vec<u8>| {
-                Sv2Error::Config(format!(
-                    "authority public key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
-
-        let secret_key: [u8; 32] = hex::decode(secret_key_hex)
-            .map_err(|e| Sv2Error::Config(format!("invalid authority secret key hex: {e}")))?
-            .try_into()
-            .map_err(|v: Vec<u8>| {
-                Sv2Error::Config(format!(
-                    "authority secret key must be 32 bytes, got {}",
-                    v.len()
-                ))
-            })?;
+        let public_key = Self::parse_public_key(public_key_str)?;
+        let secret_key = Self::parse_secret_key(secret_key_str)?;
 
         Ok(Self {
             public_key,
             secret_key,
             cert_validity: Duration::from_secs(cert_validity_secs),
+        })
+    }
+
+    /// Parse a public key from SRI Base58Check format, falling back to hex.
+    fn parse_public_key(s: &str) -> Result<[u8; 32], Sv2Error> {
+        // Try SRI Base58Check first
+        if let Ok(pk) = s.parse::<Secp256k1PublicKey>() {
+            return Ok(pk.into_bytes());
+        }
+        // Fall back to raw hex
+        let bytes = hex::decode(s).map_err(|e| {
+            Sv2Error::Config(format!(
+                "authority public key is neither valid SRI Base58Check nor hex: {e}"
+            ))
+        })?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            Sv2Error::Config(format!(
+                "authority public key must be 32 bytes, got {}",
+                v.len()
+            ))
+        })
+    }
+
+    /// Parse a secret key from SRI Base58Check format, falling back to hex.
+    fn parse_secret_key(s: &str) -> Result<[u8; 32], Sv2Error> {
+        // Try SRI Base58Check first
+        if let Ok(sk) = s.parse::<Secp256k1SecretKey>() {
+            return Ok(sk.into_bytes());
+        }
+        // Fall back to raw hex
+        let bytes = hex::decode(s).map_err(|e| {
+            Sv2Error::Config(format!(
+                "authority secret key is neither valid SRI Base58Check nor hex: {e}"
+            ))
+        })?;
+        bytes.try_into().map_err(|v: Vec<u8>| {
+            Sv2Error::Config(format!(
+                "authority secret key must be 32 bytes, got {}",
+                v.len()
+            ))
         })
     }
 }

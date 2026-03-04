@@ -14,7 +14,7 @@ rust-version.workspace = true
 
 [features]
 test-utils = ["dep:rand", "dep:tempfile"]
-sv2 = ["dep:stratum-core"]
+sv2 = ["dep:stratum-core", "dep:key-utils"]
 
 [dependencies]
 # Optional test utilities dependencies
@@ -46,6 +46,7 @@ bitcoindrpc = { path = "../bitcoindrpc" }
 chrono = { workspace = true }
 dashmap = { workspace = true }
 stratum-core = { workspace = true, optional = true }
+key-utils = { workspace = true, optional = true }
 
 [dev-dependencies]
 bitcoindrpc = { path = "../bitcoindrpc", features = ["test-utils"] }
