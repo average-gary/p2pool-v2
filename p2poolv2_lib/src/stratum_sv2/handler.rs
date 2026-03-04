@@ -148,6 +148,12 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
     let shared_ext_channel_ids: Arc<tokio::sync::Mutex<Vec<u32>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
+    // Tracks whether this connection has opened a standard mining channel.
+    // The writer task uses this to skip standard channel messages for
+    // connections that only have extended channels.
+    let has_standard_channel: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let mut session = Sv2Session {
         downstream_id,
         setup_complete: false,
@@ -162,6 +168,7 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
     let writer_state = Arc::clone(&state);
     let _writer_connections = ctx.connections.clone();
     let writer_ext_ids = Arc::clone(&shared_ext_channel_ids);
+    let writer_has_std = Arc::clone(&has_standard_channel);
     let writer_handle = tokio::spawn(writer_task(
         write_half,
         writer_state,
@@ -170,6 +177,7 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
         job_events,
         downstream_id,
         writer_ext_ids,
+        writer_has_std,
     ));
 
     // Run the reader loop.
@@ -179,6 +187,7 @@ pub async fn handle_sv2_connection(handshake: HandshakeResult, ctx: Sv2Connectio
         &mut session,
         &ctx,
         &shared_ext_channel_ids,
+        &has_standard_channel,
     )
     .await;
 
@@ -231,6 +240,7 @@ async fn reader_loop(
     session: &mut Sv2Session,
     ctx: &Sv2ConnectionContext,
     shared_ext_channel_ids: &Arc<tokio::sync::Mutex<Vec<u32>>>,
+    has_standard_channel: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), Sv2Error> {
     // Phase 1: Read SetupConnection.
     let setup_result = tokio::time::timeout(
@@ -296,6 +306,7 @@ async fn reader_loop(
         match message {
             AnyMessage::Mining(Mining::OpenStandardMiningChannel(msg)) => {
                 handle_open_standard_channel(msg.into_static(), session, ctx, state).await?;
+                has_standard_channel.store(true, std::sync::atomic::Ordering::Release);
             }
             AnyMessage::Mining(Mining::OpenExtendedMiningChannel(msg)) => {
                 handle_open_extended_channel(
@@ -977,6 +988,7 @@ async fn writer_task(
     mut job_events: watch::Receiver<Option<JobEvent>>,
     downstream_id: DownstreamId,
     extended_channel_ids: Arc<tokio::sync::Mutex<Vec<u32>>>,
+    has_standard_channel: Arc<std::sync::atomic::AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -1018,28 +1030,33 @@ async fn writer_task(
 
                     // --- Phase 1: All job messages first ---
 
-                    // Standard channel job.
-                    let job_msg = NewMiningJob {
-                        channel_id: event.group_channel_id,
-                        job_id: event.job_id,
-                        min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
-                        version: event.job_state.version,
-                        merkle_root: event.job_state.merkle_root
-                            .to_vec()
-                            .try_into()
-                            .expect("32 bytes is valid U256"),
-                    };
+                    // Standard channel job (only if this connection has one).
+                    let send_standard = has_standard_channel.load(
+                        std::sync::atomic::Ordering::Acquire,
+                    );
+                    if send_standard {
+                        let job_msg = NewMiningJob {
+                            channel_id: event.group_channel_id,
+                            job_id: event.job_id,
+                            min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
+                            version: event.job_state.version,
+                            merkle_root: event.job_state.merkle_root
+                                .to_vec()
+                                .try_into()
+                                .expect("32 bytes is valid U256"),
+                        };
 
-                    let any_job = AnyMessage::Mining(Mining::NewMiningJob(job_msg));
-                    match encode_message(&state, any_job).await {
-                        Ok(bytes) => {
-                            if let Err(e) = writer.write_all(&bytes).await {
-                                debug!(downstream_id, "SV2 write job failed: {e}");
-                                break;
+                        let any_job = AnyMessage::Mining(Mining::NewMiningJob(job_msg));
+                        match encode_message(&state, any_job).await {
+                            Ok(bytes) => {
+                                if let Err(e) = writer.write_all(&bytes).await {
+                                    debug!(downstream_id, "SV2 write job failed: {e}");
+                                    break;
+                                }
                             }
-                        }
-                        Err(e) => {
-                            warn!(downstream_id, "failed to encode NewMiningJob: {e}");
+                            Err(e) => {
+                                warn!(downstream_id, "failed to encode NewMiningJob: {e}");
+                            }
                         }
                     }
 
@@ -1070,28 +1087,30 @@ async fn writer_task(
 
                     // --- Phase 2: All SetNewPrevHash messages ---
 
-                    // Standard channel prev_hash.
-                    if let Some(prev_hash) = event.job_state.prev_hash {
-                        let prev_hash_msg = SetNewPrevHash {
-                            channel_id: event.group_channel_id,
-                            job_id: event.job_id,
-                            prev_hash: prev_hash
-                                .to_vec()
-                                .try_into()
-                                .expect("32 bytes is valid U256"),
-                            min_ntime: event.job_state.min_ntime,
-                            nbits: event.job_state.nbits,
-                        };
-                        let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
-                        match encode_message(&state, any_prev).await {
-                            Ok(bytes) => {
-                                if let Err(e) = writer.write_all(&bytes).await {
-                                    debug!(downstream_id, "SV2 write prev_hash failed: {e}");
-                                    break;
+                    // Standard channel prev_hash (only if this connection has one).
+                    if send_standard {
+                        if let Some(prev_hash) = event.job_state.prev_hash {
+                            let prev_hash_msg = SetNewPrevHash {
+                                channel_id: event.group_channel_id,
+                                job_id: event.job_id,
+                                prev_hash: prev_hash
+                                    .to_vec()
+                                    .try_into()
+                                    .expect("32 bytes is valid U256"),
+                                min_ntime: event.job_state.min_ntime,
+                                nbits: event.job_state.nbits,
+                            };
+                            let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+                            match encode_message(&state, any_prev).await {
+                                Ok(bytes) => {
+                                    if let Err(e) = writer.write_all(&bytes).await {
+                                        debug!(downstream_id, "SV2 write prev_hash failed: {e}");
+                                        break;
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
+                                Err(e) => {
+                                    warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
+                                }
                             }
                         }
                     }
