@@ -407,18 +407,13 @@ impl Sv2Config {
                 Err("authority_secret_key provided without authority_public_key".to_string())
             }
             (Some(pk), Some(sk)) => {
-                // Basic format checks
+                // Validate keys are non-empty and parseable (SRI Base58Check or hex).
+                // Actual parsing/decoding happens later in AuthorityKeypair::from_config().
                 if pk.is_empty() {
                     return Err("authority_public_key must not be empty".to_string());
                 }
-                if sk.len() != 64 {
-                    return Err(format!(
-                        "authority_secret_key must be 64 hex characters (32 bytes), got {}",
-                        sk.len()
-                    ));
-                }
-                if hex::decode(sk).is_err() {
-                    return Err("authority_secret_key must be valid hex".to_string());
+                if sk.is_empty() {
+                    return Err("authority_secret_key must not be empty".to_string());
                 }
                 Ok(())
             }
