@@ -460,26 +460,10 @@ async fn handle_open_standard_channel(
     }
 
     // Bootstrap: send the current active job to this channel.
-    // SetNewPrevHash is sent before NewMiningJob so downstream clients
-    // have the block context before receiving a non-future job.
+    // Per SV2 spec, NewMiningJob must be sent BEFORE SetNewPrevHash so
+    // the downstream can register the job_id before it is activated.
     if let Ok(Some(active)) = ctx.job_distributor.get_active_job(group_channel_id).await {
-        // Send SetNewPrevHash first if the job is activated (not future).
-        if let (Some(prev_hash), Some(nbits)) = (active.prev_hash, active.nbits) {
-            let prev_hash_msg = SetNewPrevHash {
-                channel_id,
-                job_id: active.job_id,
-                prev_hash: prev_hash
-                    .to_vec()
-                    .try_into()
-                    .expect("32 bytes is valid U256"),
-                min_ntime: active.min_ntime,
-                nbits,
-            };
-            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
-            send_message(state, &ctx.connections, session.downstream_id, any).await?;
-        }
-
-        // Send NewMiningJob.
+        // Send NewMiningJob first.
         let job_msg = NewMiningJob {
             channel_id,
             job_id: active.job_id,
@@ -497,6 +481,22 @@ async fn handle_open_standard_channel(
         };
         let any = AnyMessage::Mining(Mining::NewMiningJob(job_msg));
         send_message(state, &ctx.connections, session.downstream_id, any).await?;
+
+        // Then send SetNewPrevHash to activate the job.
+        if let (Some(prev_hash), Some(nbits)) = (active.prev_hash, active.nbits) {
+            let prev_hash_msg = SetNewPrevHash {
+                channel_id,
+                job_id: active.job_id,
+                prev_hash: prev_hash
+                    .to_vec()
+                    .try_into()
+                    .expect("32 bytes is valid U256"),
+                min_ntime: active.min_ntime,
+                nbits,
+            };
+            let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+            send_message(state, &ctx.connections, session.downstream_id, any).await?;
+        }
     }
 
     // Initialize a difficulty adjuster for this channel.
@@ -590,12 +590,19 @@ async fn handle_open_extended_channel(
     shared_ext_channel_ids.lock().await.push(channel_id);
 
     // Bootstrap: send the current active extended job.
+    // Per SV2 spec, NewExtendedMiningJob must be sent BEFORE SetNewPrevHash
+    // so the downstream can register the job_id before it is activated.
     if let Ok(Some(active)) = ctx
         .job_distributor
         .get_active_extended_job(channel_id)
         .await
     {
-        // Send SetNewPrevHash first if the job is activated.
+        // Send NewExtendedMiningJob first.
+        let ext_job_msg = build_extended_job_message(channel_id, &active.job_state);
+        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
+        send_message(state, &ctx.connections, session.downstream_id, any).await?;
+
+        // Then send SetNewPrevHash to activate the job.
         if let Some(prev_hash) = active.job_state.prev_hash {
             let prev_hash_msg = SetNewPrevHash {
                 channel_id,
@@ -610,11 +617,6 @@ async fn handle_open_extended_channel(
             let any = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
             send_message(state, &ctx.connections, session.downstream_id, any).await?;
         }
-
-        // Send NewExtendedMiningJob.
-        let ext_job_msg = build_extended_job_message(channel_id, &active.job_state);
-        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
-        send_message(state, &ctx.connections, session.downstream_id, any).await?;
     }
 
     // Initialize a difficulty adjuster for this channel.
@@ -1011,38 +1013,10 @@ async fn writer_task(
                 }
                 let event = job_events.borrow_and_update().clone();
                 if let Some(event) = event {
-                    // Send SetNewPrevHash before NewMiningJob so downstream
-                    // clients have block context before receiving a non-future job.
+                    // Per SV2 spec, NewMiningJob must be sent BEFORE SetNewPrevHash
+                    // so the downstream can register the job_id before it is activated.
 
-                    // If the job is activated (not future), send SetNewPrevHash first.
-                    if let Some(prev_hash) = event.job_state.prev_hash {
-                        let prev_hash_msg = SetNewPrevHash {
-                            channel_id: event.group_channel_id,
-                            job_id: event.job_id,
-                            prev_hash: prev_hash
-                                .to_vec()
-                                .try_into()
-                                .expect("32 bytes is valid U256"),
-                            min_ntime: event.job_state.min_ntime,
-                            nbits: event.job_state.nbits,
-                        };
-                        let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
-                        match encode_message(&state, any_prev).await {
-                            Ok(bytes) => {
-                                if let Err(e) = writer.write_all(&bytes).await {
-                                    debug!(downstream_id, "SV2 write prev_hash failed: {e}");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
-                            }
-                        }
-                    }
-
-                    // Encode and write NewMiningJob.
-                    // The event.group_channel_id tells us which group this is for.
-                    // We use channel_id 0 (group broadcast) for group-level messages.
+                    // Send NewMiningJob first.
                     let job_msg = NewMiningJob {
                         channel_id: event.group_channel_id,
                         job_id: event.job_id,
@@ -1071,15 +1045,59 @@ async fn writer_task(
                         }
                     }
 
+                    // Then send SetNewPrevHash to activate the job.
+                    if let Some(prev_hash) = event.job_state.prev_hash {
+                        let prev_hash_msg = SetNewPrevHash {
+                            channel_id: event.group_channel_id,
+                            job_id: event.job_id,
+                            prev_hash: prev_hash
+                                .to_vec()
+                                .try_into()
+                                .expect("32 bytes is valid U256"),
+                            min_ntime: event.job_state.min_ntime,
+                            nbits: event.job_state.nbits,
+                        };
+                        let any_prev = AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash_msg));
+                        match encode_message(&state, any_prev).await {
+                            Ok(bytes) => {
+                                if let Err(e) = writer.write_all(&bytes).await {
+                                    debug!(downstream_id, "SV2 write prev_hash failed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(downstream_id, "failed to encode SetNewPrevHash: {e}");
+                            }
+                        }
+                    }
+
                     // Send NewExtendedMiningJob for each extended channel
-                    // owned by this connection.
+                    // owned by this connection (job before prev_hash).
                     let ext_ids = extended_channel_ids.lock().await;
                     for ext_event in &event.extended_jobs {
                         if !ext_ids.contains(&ext_event.channel_id) {
                             continue;
                         }
 
-                        // Send SetNewPrevHash for this extended channel
+                        // Send NewExtendedMiningJob first.
+                        let ext_job_msg = build_extended_job_message(
+                            ext_event.channel_id,
+                            &ext_event.job_state,
+                        );
+                        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
+                        match encode_message(&state, any).await {
+                            Ok(bytes) => {
+                                if let Err(e) = writer.write_all(&bytes).await {
+                                    debug!(downstream_id, "SV2 write ext job failed: {e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                warn!(downstream_id, "failed to encode NewExtendedMiningJob: {e}");
+                            }
+                        }
+
+                        // Then send SetNewPrevHash to activate it.
                         if let Some(prev_hash) = ext_event.job_state.prev_hash {
                             let prev_hash_msg = SetNewPrevHash {
                                 channel_id: ext_event.channel_id,
@@ -1102,24 +1120,6 @@ async fn writer_task(
                                 Err(e) => {
                                     warn!(downstream_id, "failed to encode ext SetNewPrevHash: {e}");
                                 }
-                            }
-                        }
-
-                        // Send NewExtendedMiningJob
-                        let ext_job_msg = build_extended_job_message(
-                            ext_event.channel_id,
-                            &ext_event.job_state,
-                        );
-                        let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
-                        match encode_message(&state, any).await {
-                            Ok(bytes) => {
-                                if let Err(e) = writer.write_all(&bytes).await {
-                                    debug!(downstream_id, "SV2 write ext job failed: {e}");
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                warn!(downstream_id, "failed to encode NewExtendedMiningJob: {e}");
                             }
                         }
                     }

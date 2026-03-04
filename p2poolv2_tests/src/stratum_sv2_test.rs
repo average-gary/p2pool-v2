@@ -682,22 +682,23 @@ async fn test_sv2_job_distribution_on_new_template() {
         .expect("new_template failed");
 
     // The client should receive SetNewPrevHash followed by NewMiningJob.
+    // Per SV2 spec: NewMiningJob is sent before SetNewPrevHash.
     let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
     match &msg1 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => {
+            assert!(job.job_id > 0, "job_id should be positive");
+        }
+        other => panic!("expected NewMiningJob, got: {other:?}"),
+    }
+
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &msg2 {
         AnyMessage::Mining(Mining::SetNewPrevHash(prev_hash)) => {
             // prev_hash should be non-zero.
             let all_zero = prev_hash.prev_hash.inner_as_ref().iter().all(|&b| b == 0);
             assert!(!all_zero, "prev_hash should not be all zeros");
         }
         other => panic!("expected SetNewPrevHash, got: {other:?}"),
-    }
-
-    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    match &msg2 {
-        AnyMessage::Mining(Mining::NewMiningJob(job)) => {
-            assert!(job.job_id > 0, "job_id should be positive");
-        }
-        other => panic!("expected NewMiningJob, got: {other:?}"),
     }
 }
 
@@ -850,19 +851,19 @@ async fn test_sv2_submit_share_low_difficulty() {
         .await
         .expect("new_template failed");
 
-    // Receive SetNewPrevHash first.
+    // Per SV2 spec: NewMiningJob is sent before SetNewPrevHash.
     let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    match &msg1 {
-        AnyMessage::Mining(Mining::SetNewPrevHash(_)) => { /* expected */ }
-        other => panic!("expected SetNewPrevHash, got: {other:?}"),
-    }
-
-    // Receive NewMiningJob — extract the job_id for the submit.
-    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let job_id = match &msg2 {
+    let job_id = match &msg1 {
         AnyMessage::Mining(Mining::NewMiningJob(job)) => job.job_id,
         other => panic!("expected NewMiningJob, got: {other:?}"),
     };
+
+    // Receive SetNewPrevHash to activate the job.
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(_)) => { /* expected */ }
+        other => panic!("expected SetNewPrevHash, got: {other:?}"),
+    }
 
     // Submit a share with a fabricated (random) nonce.
     // With difficulty-1 target, a random nonce will almost certainly not
@@ -942,19 +943,20 @@ async fn test_sv2_new_block_scenario() {
         .await
         .expect("new_template 1 failed");
 
+    // Per SV2 spec: NewMiningJob is sent before SetNewPrevHash.
     let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let first_prev_hash = match &msg1 {
-        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
-        other => panic!("expected SetNewPrevHash (1st), got: {other:?}"),
-    };
-
-    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let first_job_id = match &msg2 {
+    let first_job_id = match &msg1 {
         AnyMessage::Mining(Mining::NewMiningJob(job)) => {
             assert!(job.job_id > 0, "first job_id should be positive");
             job.job_id
         }
         other => panic!("expected NewMiningJob (1st), got: {other:?}"),
+    };
+
+    let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let first_prev_hash = match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
+        other => panic!("expected SetNewPrevHash (1st), got: {other:?}"),
     };
 
     // --- Second template (two-txns fixture, different previousblockhash) ---
@@ -973,18 +975,18 @@ async fn test_sv2_new_block_scenario() {
         .expect("new_template 2 failed");
 
     let msg3 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let second_prev_hash = match &msg3 {
-        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
-        other => panic!("expected SetNewPrevHash (2nd), got: {other:?}"),
-    };
-
-    let msg4 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let second_job_id = match &msg4 {
+    let second_job_id = match &msg3 {
         AnyMessage::Mining(Mining::NewMiningJob(job)) => {
             assert!(job.job_id > 0, "second job_id should be positive");
             job.job_id
         }
         other => panic!("expected NewMiningJob (2nd), got: {other:?}"),
+    };
+
+    let msg4 = client.recv_with_timeout(Duration::from_secs(3)).await;
+    let second_prev_hash = match &msg4 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.prev_hash.inner_as_ref().to_vec(),
+        other => panic!("expected SetNewPrevHash (2nd), got: {other:?}"),
     };
 
     // Verify the two templates produced different jobs and different prev_hashes.
@@ -1100,17 +1102,17 @@ async fn test_sv2_emissions_pipeline_integration() {
         .await
         .expect("new_template failed");
 
-    // Receive SetNewPrevHash + NewMiningJob.
+    // Per SV2 spec: NewMiningJob is sent before SetNewPrevHash.
     let msg1 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let ntime = match &msg1 {
-        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.min_ntime,
-        other => panic!("expected SetNewPrevHash, got: {other:?}"),
+    let job_id = match &msg1 {
+        AnyMessage::Mining(Mining::NewMiningJob(job)) => job.job_id,
+        other => panic!("expected NewMiningJob, got: {other:?}"),
     };
 
     let msg2 = client.recv_with_timeout(Duration::from_secs(3)).await;
-    let job_id = match &msg2 {
-        AnyMessage::Mining(Mining::NewMiningJob(job)) => job.job_id,
-        other => panic!("expected NewMiningJob, got: {other:?}"),
+    let ntime = match &msg2 {
+        AnyMessage::Mining(Mining::SetNewPrevHash(ph)) => ph.min_ntime,
+        other => panic!("expected SetNewPrevHash, got: {other:?}"),
     };
 
     // Submit a share. With the all-0xFF target, any hash should meet the
