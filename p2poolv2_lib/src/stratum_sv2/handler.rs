@@ -460,18 +460,14 @@ async fn handle_open_standard_channel(
     }
 
     // Bootstrap: send the current active job to this channel.
-    // Per SV2 spec, NewMiningJob must be sent BEFORE SetNewPrevHash so
-    // the downstream can register the job_id before it is activated.
+    // Per SV2 spec (matching SRI pool behavior), jobs are always sent as
+    // "future" jobs (min_ntime = None), then activated by SetNewPrevHash.
     if let Ok(Some(active)) = ctx.job_distributor.get_active_job(group_channel_id).await {
-        // Send NewMiningJob first.
+        // Send NewMiningJob as a future job (min_ntime = None).
         let job_msg = NewMiningJob {
             channel_id,
             job_id: active.job_id,
-            min_ntime: if active.job_state.is_future {
-                stratum_core::binary_sv2::Sv2Option::new(None)
-            } else {
-                stratum_core::binary_sv2::Sv2Option::new(Some(active.min_ntime))
-            },
+            min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
             version: active.version,
             merkle_root: active
                 .merkle_root
@@ -482,7 +478,7 @@ async fn handle_open_standard_channel(
         let any = AnyMessage::Mining(Mining::NewMiningJob(job_msg));
         send_message(state, &ctx.connections, session.downstream_id, any).await?;
 
-        // Then send SetNewPrevHash to activate the job.
+        // Then send SetNewPrevHash to activate the future job.
         if let (Some(prev_hash), Some(nbits)) = (active.prev_hash, active.nbits) {
             let prev_hash_msg = SetNewPrevHash {
                 channel_id,
@@ -590,19 +586,19 @@ async fn handle_open_extended_channel(
     shared_ext_channel_ids.lock().await.push(channel_id);
 
     // Bootstrap: send the current active extended job.
-    // Per SV2 spec, NewExtendedMiningJob must be sent BEFORE SetNewPrevHash
-    // so the downstream can register the job_id before it is activated.
+    // Per SV2 spec (matching SRI pool behavior), jobs are always sent as
+    // "future" jobs (min_ntime = None), then activated by SetNewPrevHash.
     if let Ok(Some(active)) = ctx
         .job_distributor
         .get_active_extended_job(channel_id)
         .await
     {
-        // Send NewExtendedMiningJob first.
-        let ext_job_msg = build_extended_job_message(channel_id, &active.job_state);
+        // Send NewExtendedMiningJob as a future job (min_ntime = None).
+        let ext_job_msg = build_extended_job_message_as_future(channel_id, &active.job_state);
         let any = AnyMessage::Mining(Mining::NewExtendedMiningJob(ext_job_msg));
         send_message(state, &ctx.connections, session.downstream_id, any).await?;
 
-        // Then send SetNewPrevHash to activate the job.
+        // Then send SetNewPrevHash to activate the future job.
         if let Some(prev_hash) = active.job_state.prev_hash {
             let prev_hash_msg = SetNewPrevHash {
                 channel_id,
@@ -631,18 +627,17 @@ async fn handle_open_extended_channel(
     Ok(())
 }
 
-/// Build a `NewExtendedMiningJob` message from an extended job state.
-fn build_extended_job_message(
+/// Build a `NewExtendedMiningJob` message as a **future job** (`min_ntime = None`).
+///
+/// Per SV2 protocol flow (as implemented by SRI pool), jobs are always sent
+/// with `min_ntime = None` ("future" job), then activated by a subsequent
+/// `SetNewPrevHash` message that sets the `min_ntime` and activates mining.
+/// This is required for compatibility with the SRI translator proxy.
+fn build_extended_job_message_as_future(
     channel_id: u32,
     job_state: &Sv2ExtendedJobState,
 ) -> NewExtendedMiningJob<'static> {
     use stratum_core::binary_sv2::{B064K, Seq0255, Sv2Option, U256};
-
-    let min_ntime: Sv2Option<'static, u32> = if job_state.is_future {
-        Sv2Option::new(None)
-    } else {
-        Sv2Option::new(Some(job_state.min_ntime))
-    };
 
     let path_u256s: Vec<U256<'static>> = job_state
         .merkle_path
@@ -665,7 +660,7 @@ fn build_extended_job_message(
     NewExtendedMiningJob {
         channel_id,
         job_id: job_state.job_id,
-        min_ntime,
+        min_ntime: Sv2Option::new(None),
         version: job_state.version,
         version_rolling_allowed: true,
         merkle_path,
@@ -1013,18 +1008,16 @@ async fn writer_task(
                 }
                 let event = job_events.borrow_and_update().clone();
                 if let Some(event) = event {
-                    // Per SV2 spec, NewMiningJob must be sent BEFORE SetNewPrevHash
-                    // so the downstream can register the job_id before it is activated.
+                    // Per SV2 spec (matching SRI pool behavior), jobs are always
+                    // sent as "future" jobs (min_ntime = None), then activated by
+                    // SetNewPrevHash. This ensures the downstream registers the
+                    // job_id before it is activated.
 
-                    // Send NewMiningJob first.
+                    // Send NewMiningJob as a future job (min_ntime = None).
                     let job_msg = NewMiningJob {
                         channel_id: event.group_channel_id,
                         job_id: event.job_id,
-                        min_ntime: if event.job_state.is_future {
-                            stratum_core::binary_sv2::Sv2Option::new(None)
-                        } else {
-                            stratum_core::binary_sv2::Sv2Option::new(Some(event.job_state.min_ntime))
-                        },
+                        min_ntime: stratum_core::binary_sv2::Sv2Option::new(None),
                         version: event.job_state.version,
                         merkle_root: event.job_state.merkle_root
                             .to_vec()
@@ -1072,15 +1065,15 @@ async fn writer_task(
                     }
 
                     // Send NewExtendedMiningJob for each extended channel
-                    // owned by this connection (job before prev_hash).
+                    // owned by this connection (future job, then prev_hash).
                     let ext_ids = extended_channel_ids.lock().await;
                     for ext_event in &event.extended_jobs {
                         if !ext_ids.contains(&ext_event.channel_id) {
                             continue;
                         }
 
-                        // Send NewExtendedMiningJob first.
-                        let ext_job_msg = build_extended_job_message(
+                        // Send NewExtendedMiningJob as a future job.
+                        let ext_job_msg = build_extended_job_message_as_future(
                             ext_event.channel_id,
                             &ext_event.job_state,
                         );
