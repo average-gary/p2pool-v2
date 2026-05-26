@@ -376,10 +376,8 @@ pub trait BitcoindLike: Send + Sync {
 
     /// Fetch a block template for the given network (`getblocktemplate`).
     /// Returns the raw JSON template as a string.
-    async fn getblocktemplate(
-        &self,
-        network: bitcoin::Network,
-    ) -> Result<String, BitcoindRpcError>;
+    async fn getblocktemplate(&self, network: bitcoin::Network)
+    -> Result<String, BitcoindRpcError>;
 
     /// Decode a raw bitcoin transaction via `decoderawtransaction`.
     async fn decoderawtransaction(
