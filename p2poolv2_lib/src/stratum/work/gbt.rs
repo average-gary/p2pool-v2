@@ -18,7 +18,7 @@ use crate::stratum::work::block_template::BlockTemplate;
 use crate::stratum::work::error::WorkError;
 use crate::stratum::work::notify::{NotifyCmd, NotifySender};
 use bitcoin::hashes::{Hash, sha256d};
-use bitcoindrpc::{BitcoinRpcConfig, BitcoindRpcClient};
+use bitcoindrpc::{BitcoinRpcConfig, BitcoindLike, BitcoindRpcClient};
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument};
 
@@ -86,7 +86,7 @@ fn compute_merkle_branches(input_txids: Vec<sha256d::Hash>) -> Vec<sha256d::Hash
 /// Parse the received JSON into a BlockTemplate struct and return it.
 #[instrument(level = "debug", skip(bitcoind))]
 async fn get_block_template(
-    bitcoind: &BitcoindRpcClient,
+    bitcoind: &dyn BitcoindLike,
     network: bitcoin::Network,
 ) -> Result<BlockTemplate, Box<dyn std::error::Error + Send + Sync>> {
     match bitcoind.getblocktemplate(network).await {

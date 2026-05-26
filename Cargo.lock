@@ -518,6 +518,7 @@ dependencies = [
 name = "bitcoindrpc"
 version = "0.10.16"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "bitcoin",
  "hex",

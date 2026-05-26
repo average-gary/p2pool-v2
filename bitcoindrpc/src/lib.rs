@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License along with
 // P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
 
+use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bitcoin::consensus::encode::serialize_hex;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,9 @@ use tracing::{debug, error};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
 
 /// JSON-RPC 1.0 request structure (Bitcoin Core format)
 #[derive(Serialize)]
@@ -336,6 +340,97 @@ impl BitcoindRpcClient {
         // Make the RPC request - submitblock returns null on success, or error string on failure
         let result: serde_json::Value = self.request("submitblock", params).await?;
         Ok(result.to_string())
+    }
+
+    /// Validate a proposed bitcoin block by calling getblocktemplate in proposal mode.
+    /// Returns Ok(true) if bitcoind responded "duplicate" (already in chain), Ok(false) otherwise.
+    pub async fn validate_block_proposal(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<bool, BitcoindRpcError> {
+        let block_hex = hex::encode(bitcoin::consensus::encode::serialize(block));
+        let params = vec![serde_json::json!({
+            "mode": "proposal",
+            "data": block_hex,
+        })];
+        let response: serde_json::Value = self.request("getblocktemplate", params).await?;
+        Ok(response == "duplicate")
+    }
+}
+
+/// Trait abstraction over the parts of bitcoind's JSON-RPC API that p2poolv2 uses.
+///
+/// This allows callers (and downstream crates such as `sv2-p2pool-engine`) to
+/// substitute a mock implementation for unit tests without spinning up a real
+/// HTTP server.
+///
+/// All methods are object-safe: there are no generic methods, so callers may use
+/// `Arc<dyn BitcoindLike>` as well as `impl BitcoindLike` / generic `B: BitcoindLike`.
+#[async_trait]
+pub trait BitcoindLike: Send + Sync {
+    /// Current network difficulty (`getdifficulty`).
+    async fn get_difficulty(&self) -> Result<f64, BitcoindRpcError>;
+
+    /// Blockchain info (`getblockchaininfo`). Used for IBD checks.
+    async fn getblockchaininfo(&self) -> Result<GetBlockchainInfo, BitcoindRpcError>;
+
+    /// Fetch a block template for the given network (`getblocktemplate`).
+    /// Returns the raw JSON template as a string.
+    async fn getblocktemplate(
+        &self,
+        network: bitcoin::Network,
+    ) -> Result<String, BitcoindRpcError>;
+
+    /// Decode a raw bitcoin transaction via `decoderawtransaction`.
+    async fn decoderawtransaction(
+        &self,
+        tx: &bitcoin::Transaction,
+    ) -> Result<bitcoin::Transaction, BitcoindRpcError>;
+
+    /// Submit a mined block to bitcoind (`submitblock`).
+    async fn submit_block(&self, block: &bitcoin::Block) -> Result<String, BitcoindRpcError>;
+
+    /// Validate a candidate block via `getblocktemplate` proposal mode.
+    /// Returns true if bitcoind reports "duplicate".
+    async fn validate_block_proposal(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<bool, BitcoindRpcError>;
+}
+
+#[async_trait]
+impl BitcoindLike for BitcoindRpcClient {
+    async fn get_difficulty(&self) -> Result<f64, BitcoindRpcError> {
+        BitcoindRpcClient::get_difficulty(self).await
+    }
+
+    async fn getblockchaininfo(&self) -> Result<GetBlockchainInfo, BitcoindRpcError> {
+        BitcoindRpcClient::getblockchaininfo(self).await
+    }
+
+    async fn getblocktemplate(
+        &self,
+        network: bitcoin::Network,
+    ) -> Result<String, BitcoindRpcError> {
+        BitcoindRpcClient::getblocktemplate(self, network).await
+    }
+
+    async fn decoderawtransaction(
+        &self,
+        tx: &bitcoin::Transaction,
+    ) -> Result<bitcoin::Transaction, BitcoindRpcError> {
+        BitcoindRpcClient::decoderawtransaction(self, tx).await
+    }
+
+    async fn submit_block(&self, block: &bitcoin::Block) -> Result<String, BitcoindRpcError> {
+        BitcoindRpcClient::submit_block(self, block).await
+    }
+
+    async fn validate_block_proposal(
+        &self,
+        block: &bitcoin::Block,
+    ) -> Result<bool, BitcoindRpcError> {
+        BitcoindRpcClient::validate_block_proposal(self, block).await
     }
 }
 
