@@ -25,6 +25,7 @@ bitcoindrpc = { workspace = true }
 p2poolv2_api = { workspace = true }
 p2poolv2_cli = { path = "../p2poolv2_cli" }
 p2poolv2_lib = { workspace = true }
+p2poolv2_ipc = { workspace = true }
 
 [[bin]]
 name = "p2poolv2"

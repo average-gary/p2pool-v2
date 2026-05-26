@@ -7,6 +7,8 @@ members = [
     "p2poolv2_cli",
     "p2poolv2_api",
     "p2poolv2_tests",
+    "p2poolv2_ipc",
+    "p2poolv2-capnp-types",
 ]
 resolver = "2"
 
@@ -84,6 +86,8 @@ bitcoindrpc = { path = "bitcoindrpc" }
 p2poolv2_config = { path = "p2poolv2_config" }
 p2poolv2_api = { path = "p2poolv2_api" }
 p2poolv2_lib = { path = "p2poolv2_lib", features = ["test-utils"] }
+p2poolv2_ipc = { path = "p2poolv2_ipc" }
+p2poolv2-capnp-types = { path = "p2poolv2-capnp-types" }
 reqwest = { version = "0.12", features = ["json"] }
 mockall = "0.13.1"
 mockall_double = "0.3.1"

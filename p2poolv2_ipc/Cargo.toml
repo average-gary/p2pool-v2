@@ -1,0 +1,30 @@
+[package]
+name = "p2poolv2_ipc"
+description = "Cap'n Proto IPC server (Unix socket) exposing the p2poolv2 share-chain interface"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+# AGPL: this crate is part of the p2poolv2 daemon and inherits its
+# license. The data/schema crate `p2poolv2-capnp-types` is dual-licensed
+# MIT/Apache so non-AGPL clients can depend on it. See ADR 0010 in the
+# sv2-p2pool repo.
+license.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+p2poolv2-capnp-types = { path = "../p2poolv2-capnp-types" }
+capnp = "0.25"
+capnp-rpc = "0.25"
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["compat"] }
+futures = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

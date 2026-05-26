@@ -1,0 +1,25 @@
+[package]
+name = "p2poolv2-capnp-types"
+description = "Cap'n Proto schema and generated Rust bindings for the p2poolv2 IPC interface"
+version = "0.1.0"
+edition = "2024"
+# Schema/data crate, dual-licensed to match the `bitcoin-capnp-types` precedent
+# (https://github.com/2140-dev/bitcoin-capnp-types). The AGPL boundary stays at
+# the p2poolv2 daemon binary, not at this schema crate.
+license = "MIT OR Apache-2.0"
+authors = ["P2Poolv2 Developers"]
+homepage = "https://github.com/p2poolv2/p2poolv2"
+repository = "https://github.com/p2poolv2/p2poolv2"
+keywords = ["bitcoin", "mining", "pool", "capnp", "ipc"]
+categories = ["cryptography::cryptocurrencies"]
+readme = "README.md"
+# Set to false for the initial PR; flip to true (and bump version) when
+# the schema stabilizes and we're ready to publish to crates.io per
+# ADR 0010 (sv2-p2pool repo, docs/adr/0010-capnp-schema-hosting.md).
+publish = false
+
+[dependencies]
+capnp = "0.25"
+
+[build-dependencies]
+capnpc = "0.25"

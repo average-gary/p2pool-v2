@@ -378,6 +378,19 @@ impl std::fmt::Debug for ApiConfig {
     }
 }
 
+/// Configuration for the optional Cap'n Proto IPC server.
+///
+/// When set, p2poolv2 binds a Unix socket and exposes the
+/// `ShareChain` interface defined by the `p2poolv2-capnp-types` crate.
+/// Phase-2 ships a stub implementation only — see the `p2poolv2_ipc`
+/// crate for details.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct IpcConfig {
+    /// Filesystem path of the Unix socket to bind. Absolute paths are
+    /// recommended; the parent directory must exist and be writable.
+    pub socket_path: String,
+}
+
 /// Config for p2poolv2 nodes
 ///
 /// The network config switches to defaults if not provided. This is
@@ -392,6 +405,10 @@ pub struct Config {
     pub bitcoinrpc: BitcoinRpcConfig,
     pub logging: LoggingConfig,
     pub api: ApiConfig,
+    /// Optional Cap'n Proto IPC server configuration. When absent the
+    /// IPC server is not started, preserving the current behaviour.
+    #[serde(default)]
+    pub ipc: Option<IpcConfig>,
 }
 
 #[allow(dead_code)]

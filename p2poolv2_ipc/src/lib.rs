@@ -1,0 +1,54 @@
+// Copyright (C) 2024-2026 P2Poolv2 Developers (see AUTHORS)
+//
+// This file is part of P2Poolv2
+//
+// P2Poolv2 is free software: you can redistribute it and/or modify it under
+// the terms of the GNU Affero General Public License as published by the Free
+// Software Foundation, either version 3 of the License, or (at your option)
+// any later version.
+//
+// P2Poolv2 is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+// FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for more
+// details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with P2Poolv2. If not, see <https://www.gnu.org/licenses/>.
+
+//! Cap'n Proto IPC server exposing the p2poolv2 [`ShareChain`] interface.
+//!
+//! This crate is the server-side counterpart of [`p2poolv2-capnp-types`]
+//! (which carries the schema). It listens on a Unix socket and wires
+//! incoming Cap'n Proto RPC calls to a [`ShareChain`] implementation.
+//!
+//! # Status: Phase 2 stub
+//!
+//! The handler returns placeholder responses for every method. Real
+//! integration with the share-chain (`p2poolv2_lib::shares::chain::*`)
+//! is intentionally deferred to a follow-up PR — see the sv2-p2pool
+//! integration plan §4.4 and ADR 0010 for the rollout plan.
+//!
+//! [`p2poolv2-capnp-types`]: ../p2poolv2_capnp_types/index.html
+//! [`ShareChain`]: p2poolv2_capnp_types::p2poolv2_capnp::share_chain
+
+pub mod server;
+
+pub use server::{ShareChainStub, run_ipc_server, spawn_ipc_server};
+
+/// Errors emitted by the IPC server.
+#[derive(Debug, thiserror::Error)]
+pub enum IpcError {
+    /// The configured Unix socket path could not be bound.
+    #[error("failed to bind Unix socket {path:?}: {source}")]
+    BindFailed {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// An accept loop I/O error.
+    #[error("accept loop I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// A Cap'n Proto RPC error.
+    #[error("capnp error: {0}")]
+    Capnp(#[from] capnp::Error),
+}

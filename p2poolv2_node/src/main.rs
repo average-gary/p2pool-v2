@@ -333,6 +333,18 @@ async fn main() -> ExitCode {
         config.api.hostname, config.api.port
     );
 
+    // Optional Cap'n Proto IPC server (Phase-2 stub). Only started when
+    // `[ipc]` is present in the node config. Real share-chain wiring is
+    // a follow-up PR — see the `p2poolv2_ipc` crate docs and ADR 0010
+    // in the sv2-p2pool repo.
+    let _ipc_handle = config.ipc.as_ref().map(|ipc_cfg| {
+        info!(
+            socket = %ipc_cfg.socket_path,
+            "Starting p2poolv2 Cap'n Proto IPC server (stub)"
+        );
+        p2poolv2_ipc::spawn_ipc_server(ipc_cfg.socket_path.clone())
+    });
+
     let mut exit_receiver = exit_sender.subscribe();
     let stop_all = async move |reason: ShutdownReason| -> ShutdownReason {
         info!("Node shutting down...");
