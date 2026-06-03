@@ -7,9 +7,12 @@
 //!
 //! Method status:
 //!
-//! - `validate_template` — still a placeholder stub. Needs a real
-//!   `ChainStoreHandle` plumbed in plus coinbase-prefix/suffix
-//!   reconstruction + wtxid-commitment validation.
+//! - `validate_template` — structural pre-check only. Glues
+//!   prefix+suffix and confirms the coinbase parses as a
+//!   `bitcoin::Transaction`; on parse failure returns
+//!   `InvalidCoinbase(<reason>)`, otherwise returns `Ok`. Full
+//!   share-chain admission (coinbase value, wtxid commitment against
+//!   the share-chain tip) still needs a `ChainStoreHandle` plumbed in.
 //! - `submit_solution` — real `shareHash == block_hash()` consistency
 //!   check. Deserialises rawBlock, recomputes the hash, rejects on
 //!   mismatch. Full share-chain admission (PoW, ancestry, payout
@@ -37,10 +40,14 @@ use crate::IpcError;
 
 /// Server-side actor for the [`share_chain::Server`] capnp interface.
 ///
-/// `submit_solution` performs a real shareHash↔block_hash consistency
-/// check. `subscribe_chain_tip` fans out from an injected
-/// `watch::Receiver<BlockHash>` when present. `validate_template`
-/// remains a stub — see the module-level docs.
+/// - `validate_template` — structural pre-check (coinbase parses).
+/// - `submit_solution` — real `shareHash == block_hash()` consistency
+///   check.
+/// - `subscribe_chain_tip` — fans out from an injected
+///   `watch::Receiver<BlockHash>` when present.
+///
+/// See the module-level docs for the gap between this and a full
+/// share-chain admission implementation.
 #[derive(Clone, Default)]
 pub struct ShareChainStub {
     /// Optional tip-watch receiver. When `Some`, `subscribe_chain_tip`
@@ -73,15 +80,49 @@ impl share_chain::Server for ShareChainStub {
     #[allow(refining_impl_trait)]
     fn validate_template(
         self: Rc<Self>,
-        _params: share_chain::ValidateTemplateParams,
+        params: share_chain::ValidateTemplateParams,
         mut results: share_chain::ValidateTemplateResults,
     ) -> Promise<(), capnp::Error> {
-        debug!("ShareChainStub::validate_template called (stub)");
-        // Stub: always report `ok`. Real implementation will validate
-        // coinbase prefix/suffix against the share-chain tip and the
-        // wtxid commitment, returning structured failure variants.
+        // Structural pre-check: glue prefix+suffix and confirm the
+        // result is a parseable bitcoin::Transaction. A real
+        // share-chain admission decision (coinbase value, wtxid
+        // commitment against the share-chain tip, etc.) still
+        // requires a ChainStoreHandle plumbed in — see the module
+        // docs. Until that lands, we filter the obviously-bad
+        // (garbage prefix/suffix bytes) and accept everything else.
+        let reader = match params.get() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let prefix = match reader.get_coinbase_prefix() {
+            Ok(d) => d,
+            Err(e) => return Promise::err(e),
+        };
+        let suffix = match reader.get_coinbase_suffix() {
+            Ok(d) => d,
+            Err(e) => return Promise::err(e),
+        };
+
+        let mut buf = Vec::with_capacity(prefix.len() + suffix.len());
+        buf.extend_from_slice(prefix);
+        buf.extend_from_slice(suffix);
+
         let mut result: validation_result::Builder = results.get().init_result();
-        result.set_ok(());
+        match bitcoin::consensus::deserialize::<bitcoin::Transaction>(&buf) {
+            Ok(_) => {
+                debug!(
+                    prefix_len = prefix.len(),
+                    suffix_len = suffix.len(),
+                    "validate_template: coinbase parses; structural check passed"
+                );
+                result.set_ok(());
+            }
+            Err(e) => {
+                let reason = format!("coinbase prefix+suffix did not parse: {e}");
+                warn!("validate_template: {reason}");
+                result.set_invalid_coinbase(reason.as_str());
+            }
+        }
         Promise::ok(())
     }
 
@@ -502,5 +543,77 @@ mod tests {
             }
             assert!(got_b, "tip_b never delivered; got {:x?}", received.borrow());
         });
+    }
+
+    /// Build a real coinbase tx, split it at a chosen byte offset, and
+    /// drive validate_template through the capnp client. Result must
+    /// be Ok (the structural check passes a real coinbase).
+    #[tokio::test(flavor = "current_thread")]
+    async fn validate_template_accepts_parseable_coinbase() {
+        use p2poolv2_capnp_types::p2poolv2_capnp::validation_result;
+
+        let coinbase = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::null(),
+                script_sig: bitcoin::ScriptBuf::from_bytes(vec![0u8; 16]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_0000_0000),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let serialized = bitcoin::consensus::serialize(&coinbase);
+        let split = serialized.len() / 2;
+        let prefix = &serialized[..split];
+        let suffix = &serialized[split..];
+
+        let stub: share_chain::Client = capnp_rpc::new_client(ShareChainStub::new());
+        let mut req = stub.validate_template_request();
+        {
+            let mut params = req.get();
+            params.set_coinbase_prefix(prefix);
+            params.set_coinbase_suffix(suffix);
+            params.reborrow().init_wtxid_list(0);
+            params.init_missing_txs(0);
+        }
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        match result.which().expect("variant known") {
+            validation_result::Which::Ok(()) => {} // expected
+            _ => panic!("expected Ok variant"),
+        }
+    }
+
+    /// Garbage prefix+suffix bytes that cannot deserialize as a
+    /// transaction. Must produce InvalidCoinbase, not Ok.
+    #[tokio::test(flavor = "current_thread")]
+    async fn validate_template_rejects_unparseable_coinbase() {
+        use p2poolv2_capnp_types::p2poolv2_capnp::validation_result;
+
+        let stub: share_chain::Client = capnp_rpc::new_client(ShareChainStub::new());
+        let mut req = stub.validate_template_request();
+        {
+            let mut params = req.get();
+            params.set_coinbase_prefix(b"not a");
+            params.set_coinbase_suffix(b" transaction");
+            params.reborrow().init_wtxid_list(0);
+            params.init_missing_txs(0);
+        }
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        match result.which().expect("variant known") {
+            validation_result::Which::InvalidCoinbase(reader) => {
+                let s = reader.expect("text").to_str().expect("utf-8");
+                assert!(
+                    s.contains("did not parse"),
+                    "expected reason text to mention parse failure; got {s}"
+                );
+            }
+            _ => panic!("expected InvalidCoinbase variant"),
+        }
     }
 }
