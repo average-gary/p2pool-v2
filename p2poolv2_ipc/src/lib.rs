@@ -21,19 +21,27 @@
 //! (which carries the schema). It listens on a Unix socket and wires
 //! incoming Cap'n Proto RPC calls to a [`ShareChain`] implementation.
 //!
-//! # Status: Phase 2 stub
+//! # Status: partial real wiring
 //!
-//! The handler returns placeholder responses for every method. Real
-//! integration with the share-chain (`p2poolv2_lib::shares::chain::*`)
-//! is intentionally deferred to a follow-up PR — see the sv2-p2pool
-//! integration plan §4.4 and ADR 0010 for the rollout plan.
+//! - `submit_solution` performs a real shareHash↔block_hash consistency
+//!   check; mismatches are rejected.
+//! - `subscribe_chain_tip` fans out tip changes from a
+//!   `tokio::sync::watch` receiver injected via
+//!   [`spawn_ipc_server_with_tip_source`]. With no receiver wired
+//!   (default), it preserves the original stub behaviour: subscriptions
+//!   are accepted but never fire.
+//! - `validate_template` is still a placeholder stub.
+//!
+//! See ADR 0010 in the sv2-p2pool repo for the rollout plan.
 //!
 //! [`p2poolv2-capnp-types`]: ../p2poolv2_capnp_types/index.html
 //! [`ShareChain`]: p2poolv2_capnp_types::p2poolv2_capnp::share_chain
 
 pub mod server;
 
-pub use server::{ShareChainStub, run_ipc_server, spawn_ipc_server};
+pub use server::{
+    ShareChainStub, run_ipc_server, spawn_ipc_server, spawn_ipc_server_with_tip_source,
+};
 
 /// Errors emitted by the IPC server.
 #[derive(Debug, thiserror::Error)]
