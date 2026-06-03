@@ -18,6 +18,7 @@ rust-version.workspace = true
 
 [dependencies]
 p2poolv2-capnp-types = { path = "../p2poolv2-capnp-types" }
+bitcoin = { workspace = true }
 capnp = "0.25"
 capnp-rpc = "0.25"
 tokio = { workspace = true }

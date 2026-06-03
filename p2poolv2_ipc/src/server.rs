@@ -5,10 +5,19 @@
 
 //! Cap'n Proto RPC server actor for the [`ShareChain`] interface.
 //!
-//! Phase-2 stub. Each method returns a placeholder response so that
-//! external clients (notably the sv2-p2pool integration crate) can be
-//! developed against a real Unix-socket endpoint while the share-chain
-//! wiring is implemented in a follow-up PR.
+//! `validate_template` and `subscribe_chain_tip` are still placeholder
+//! stubs (they need a real `ChainStoreHandle` plumbed in, plus —
+//! for tip subscription — a tip-change broadcast channel inside
+//! `p2poolv2_lib::shares::chain` that does not yet exist). They will
+//! be wired in follow-up PRs.
+//!
+//! `submit_solution` performs a real consistency check: it
+//! deserialises the raw block, recomputes its `block_hash()`, and
+//! verifies that matches the `shareHash` the client sent. A mismatch
+//! is a client bug (the share hash is the block hash, by the wire
+//! contract) and the call is rejected. Full share-chain admission
+//! (PoW threshold, ancestry walk, payout-script validation) still
+//! belongs to the eventual `ShareChain` actor.
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -22,11 +31,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::IpcError;
 
-/// Stub implementation of the [`share_chain::Server`] capnp interface.
+/// Server-side actor for the [`share_chain::Server`] capnp interface.
 ///
-/// All methods return placeholder responses. Real wiring to
-/// `p2poolv2_lib::shares::chain` is intentionally deferred — see the
-/// crate-level docs and the sv2-p2pool integration plan §4.4.
+/// `submit_solution` performs a real shareHash↔block_hash consistency
+/// check. `validate_template` and `subscribe_chain_tip` remain stubs —
+/// see the module-level docs.
 #[derive(Clone, Default)]
 pub struct ShareChainStub;
 
@@ -59,13 +68,65 @@ impl share_chain::Server for ShareChainStub {
     #[allow(refining_impl_trait)]
     fn submit_solution(
         self: Rc<Self>,
-        _params: share_chain::SubmitSolutionParams,
+        params: share_chain::SubmitSolutionParams,
         mut results: share_chain::SubmitSolutionResults,
     ) -> Promise<(), capnp::Error> {
-        debug!("ShareChainStub::submit_solution called (stub)");
-        // Stub: always report `accepted = true`. Real implementation
-        // will deserialize the raw block, run share validation, and
-        // either route to the bitcoind submitblock path or reject.
+        // Real consistency check: deserialize rawBlock, compute its
+        // block_hash, and verify it matches shareHash. A mismatch
+        // indicates a buggy client (the share hash MUST be the block
+        // hash; that's the wire contract).
+        //
+        // Full share-chain admission (PoW threshold, ancestry, payout
+        // script) still belongs to the eventual real ShareChain actor;
+        // this method shifts from "always accept" to "accept iff the
+        // client's claim matches the bytes they sent."
+        let reader = match params.get() {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("submit_solution: invalid params: {e}");
+                results.get().set_accepted(false);
+                return Promise::ok(());
+            }
+        };
+        let raw_block = match reader.get_raw_block() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("submit_solution: missing rawBlock: {e}");
+                results.get().set_accepted(false);
+                return Promise::ok(());
+            }
+        };
+        let claimed_share_hash = match reader.get_share_hash() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("submit_solution: missing shareHash: {e}");
+                results.get().set_accepted(false);
+                return Promise::ok(());
+            }
+        };
+        let block: bitcoin::Block = match bitcoin::consensus::deserialize(raw_block) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("submit_solution: rawBlock deserialize failed: {e}");
+                results.get().set_accepted(false);
+                return Promise::ok(());
+            }
+        };
+        use bitcoin::hashes::Hash as _;
+        let computed = *block.block_hash().as_raw_hash().as_byte_array();
+        if claimed_share_hash != computed {
+            warn!(
+                "submit_solution: shareHash {:x?} does not match block_hash {:x?}; rejecting",
+                claimed_share_hash, computed,
+            );
+            results.get().set_accepted(false);
+            return Promise::ok(());
+        }
+        debug!(
+            block_hash = %block.block_hash(),
+            txdata_len = block.txdata.len(),
+            "submit_solution: shareHash == block_hash; accepted",
+        );
         results.get().set_accepted(true);
         Promise::ok(())
     }
@@ -184,5 +245,69 @@ mod tests {
     #[test]
     fn stub_constructs() {
         let _stub = ShareChainStub::new();
+    }
+
+    /// End-to-end of the submit_solution check: drive a stub directly
+    /// through the capnp RPC layer locally (no UDS), feed it a known
+    /// block + matching shareHash, assert accepted=true; then a known
+    /// block + WRONG shareHash, assert accepted=false.
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_solution_accepts_when_share_hash_matches_block_hash() {
+        use bitcoin::hashes::Hash as _;
+        let block = bitcoin::Block {
+            header: bitcoin::blockdata::block::Header {
+                version: bitcoin::blockdata::block::Version::from_consensus(1),
+                prev_blockhash: bitcoin::BlockHash::from_raw_hash(
+                    bitcoin::hashes::Hash::all_zeros(),
+                ),
+                merkle_root: bitcoin::TxMerkleNode::from_raw_hash(
+                    bitcoin::hashes::Hash::all_zeros(),
+                ),
+                time: 1_700_000_000,
+                bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                nonce: 42,
+            },
+            txdata: vec![],
+        };
+        let raw = bitcoin::consensus::serialize(&block);
+        let block_hash = *block.block_hash().as_raw_hash().as_byte_array();
+
+        let stub: share_chain::Client = capnp_rpc::new_client(ShareChainStub::new());
+
+        // Matching shareHash → accepted.
+        let mut req = stub.submit_solution_request();
+        {
+            let mut params = req.get();
+            params.set_raw_block(&raw);
+            params.set_share_hash(&block_hash);
+        }
+        let reply = req.send().promise.await.expect("rpc ok");
+        assert!(reply.get().expect("reader").get_accepted());
+
+        // Wrong shareHash → rejected.
+        let mut bad_share = block_hash;
+        bad_share[0] ^= 0xff;
+        let mut req2 = stub.submit_solution_request();
+        {
+            let mut params = req2.get();
+            params.set_raw_block(&raw);
+            params.set_share_hash(&bad_share);
+        }
+        let reply2 = req2.send().promise.await.expect("rpc ok");
+        assert!(!reply2.get().expect("reader").get_accepted());
+    }
+
+    /// Garbage rawBlock bytes → rejected (deserialize failure).
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_solution_rejects_unparseable_raw_block() {
+        let stub: share_chain::Client = capnp_rpc::new_client(ShareChainStub::new());
+        let mut req = stub.submit_solution_request();
+        {
+            let mut params = req.get();
+            params.set_raw_block(b"not a block");
+            params.set_share_hash(&[0u8; 32]);
+        }
+        let reply = req.send().promise.await.expect("rpc ok");
+        assert!(!reply.get().expect("reader").get_accepted());
     }
 }

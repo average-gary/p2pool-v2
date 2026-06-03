@@ -3374,6 +3374,7 @@ dependencies = [
 name = "p2poolv2_ipc"
 version = "0.11.0"
 dependencies = [
+ "bitcoin",
  "capnp",
  "capnp-rpc",
  "futures",
