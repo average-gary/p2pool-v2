@@ -585,6 +585,7 @@ mod tests {
                 auth_password: None,
                 cors_allowed: false,
             },
+            ipc: None,
         };
         config.network = network_config;
 
