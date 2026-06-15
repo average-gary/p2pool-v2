@@ -63,12 +63,26 @@ const MAINNET_GENESIS_DATA: GenesisData = GenesisData {
     timestamp: 1776855600,
 };
 
+// Bitcoin Core's regtest network genesis block. Hash:
+// 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206.
+// Identical to mainnet's coinbase + header structure but with the
+// regtest-specific timestamp (1296688602), nonce (2), and bits
+// (0x207fffff = effectively-no-PoW). Used by the integration test
+// harness; not deployed on a real share-chain.
+const REGTEST_GENESIS_DATA: GenesisData = GenesisData {
+    public_key: "02ac493f2130ca56cb5c3a559860cef9a84f90b5a85dfe4ec6e6067eeee17f4d2d",
+    bitcoin_block_hex: include!("regtest.rs"),
+    bitcoin_height: 0,
+    timestamp: 1296688602,
+};
+
 /// Get the genesis data for a given network
 pub fn genesis_data(network: bitcoin::Network) -> Result<GenesisData, Box<dyn Error>> {
     match network {
         bitcoin::Network::Signet => Ok(SIGNET_GENESIS_DATA),
         bitcoin::Network::Testnet4 => Ok(TESTNET4_GENESIS_DATA),
         bitcoin::Network::Bitcoin => Ok(MAINNET_GENESIS_DATA),
+        bitcoin::Network::Regtest => Ok(REGTEST_GENESIS_DATA),
         _ => Err("Unsupported network".into()),
     }
 }
@@ -89,5 +103,19 @@ mod tests {
         let header = block.unwrap().header;
         assert_eq!(header.prev_blockhash, bitcoin::hashes::Hash::all_zeros());
         assert_eq!(header.version, bitcoin::block::Version::ONE);
+    }
+
+    #[test]
+    fn test_regtest_genesis_data() {
+        let genesis = genesis_data(bitcoin::Network::Regtest).unwrap();
+
+        let block = bitcoin::consensus::deserialize::<bitcoin::Block>(
+            hex::decode(genesis.bitcoin_block_hex).unwrap().as_slice(),
+        )
+        .expect("regtest genesis hex deserializes");
+        let expected =
+            bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+        assert_eq!(block.block_hash(), expected.block_hash());
+        assert_eq!(block.header.prev_blockhash, bitcoin::hashes::Hash::all_zeros());
     }
 }
