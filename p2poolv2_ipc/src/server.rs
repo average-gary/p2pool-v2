@@ -27,16 +27,65 @@
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use capnp::capability::Promise;
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp, twoparty};
-use p2poolv2_capnp_types::p2poolv2_capnp::{chain_tip_callback, share_chain, validation_result};
+use p2poolv2_capnp_types::p2poolv2_capnp::{
+    chain_tip_callback, chain_tip_result, network_result, share_chain, share_header_result,
+    tip_height_result, validation_result,
+};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::{debug, error, info, warn};
 
 use crate::IpcError;
+
+/// Outcome of a `get_share_header` lookup on the daemon side.
+///
+/// Mirrors the discriminated union in the capnp schema so the
+/// server can return "found", "missing", or the all-zeros genesis
+/// sentinel without overloading `capnp::Error`.
+#[derive(Debug, Clone)]
+pub enum ShareHeaderOutcome {
+    /// Header was found; carries the minimal subset the engine reads.
+    Found {
+        /// 32-byte previous share blockhash.
+        prev_share_blockhash: [u8; 32],
+    },
+    /// No header for the requested share hash.
+    NotFound,
+    /// The requested hash is the all-zeros genesis sentinel.
+    Genesis,
+}
+
+/// Server-side adapter for chain-state reads.
+///
+/// The IPC crate is intentionally light on dependencies: the
+/// p2poolv2 daemon owns the real `ChainStoreHandle` (which lives
+/// in `p2poolv2_lib`) and implements this trait for it. Tests in
+/// this crate use a small in-memory fake.
+///
+/// All methods are sync because `ChainStoreHandle` itself is sync;
+/// the capnp server runs them inline on its current-thread runtime.
+/// Errors are reported as a `String` reason which is mapped to
+/// `capnp::Error::failed` at the wire layer.
+pub trait ChainReadBackend: Send + Sync {
+    /// Return the confirmed-chain tip blockhash, or `None` when no
+    /// genesis is set up yet.
+    fn get_chain_tip(&self) -> Result<Option<[u8; 32]>, String>;
+
+    /// Return the share-header lookup outcome for `share_hash`.
+    fn get_share_header(&self, share_hash: &[u8; 32]) -> Result<ShareHeaderOutcome, String>;
+
+    /// Return the confirmed-chain tip height, or `None` when no
+    /// genesis is set up yet.
+    fn get_tip_height(&self) -> Result<Option<u32>, String>;
+
+    /// Return the bitcoin network the daemon was configured with.
+    fn network(&self) -> bitcoin::Network;
+}
 
 /// Server-side actor for the [`share_chain::Server`] capnp interface.
 ///
@@ -55,11 +104,19 @@ pub struct ShareChainStub {
     /// the client-supplied callback. When `None`, the callback is
     /// accepted and held but never fires.
     tip_rx: Option<watch::Receiver<bitcoin::BlockHash>>,
+    /// Optional chain-read backend. When `Some`, the chain-read
+    /// methods (`get_chain_tip`, `get_share_header`, `get_tip_height`,
+    /// `get_network`) delegate to this backend. When `None`, those
+    /// methods return `capnp::Error::unimplemented`. The daemon wires
+    /// in a real backend backed by `ChainStoreHandle`; tests that
+    /// don't exercise the chain reads can leave it `None`.
+    chain: Option<Arc<dyn ChainReadBackend>>,
 }
 
 impl ShareChainStub {
-    /// Construct a new stub with no tip source. `subscribe_chain_tip`
-    /// callbacks will be accepted but never fire.
+    /// Construct a new stub with no tip source and no chain backend.
+    /// `subscribe_chain_tip` callbacks will be accepted but never
+    /// fire and the chain-read methods will return `unimplemented`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -69,7 +126,16 @@ impl ShareChainStub {
     pub fn with_tip_source(tip_rx: watch::Receiver<bitcoin::BlockHash>) -> Self {
         Self {
             tip_rx: Some(tip_rx),
+            chain: None,
         }
+    }
+
+    /// Builder: attach a chain-read backend so `get_chain_tip`,
+    /// `get_share_header`, `get_tip_height`, and `get_network` can
+    /// serve real data.
+    pub fn with_chain_backend(mut self, chain: Arc<dyn ChainReadBackend>) -> Self {
+        self.chain = Some(chain);
+        self
     }
 }
 
@@ -254,6 +320,133 @@ impl share_chain::Server for ShareChainStub {
 
         Promise::ok(())
     }
+
+    #[allow(refining_impl_trait)]
+    fn get_chain_tip(
+        self: Rc<Self>,
+        _params: share_chain::GetChainTipParams,
+        mut results: share_chain::GetChainTipResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(chain) = self.chain.clone() else {
+            return Promise::err(capnp::Error::unimplemented(
+                "getChainTip: server has no chain-read backend wired".into(),
+            ));
+        };
+        let mut result: chain_tip_result::Builder = results.get().init_result();
+        match chain.get_chain_tip() {
+            Ok(Some(hash)) => {
+                result.set_tip(&hash);
+            }
+            Ok(None) => {
+                result.set_uninitialised(());
+            }
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!("getChainTip: {e}")));
+            }
+        }
+        Promise::ok(())
+    }
+
+    #[allow(refining_impl_trait)]
+    fn get_share_header(
+        self: Rc<Self>,
+        params: share_chain::GetShareHeaderParams,
+        mut results: share_chain::GetShareHeaderResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(chain) = self.chain.clone() else {
+            return Promise::err(capnp::Error::unimplemented(
+                "getShareHeader: server has no chain-read backend wired".into(),
+            ));
+        };
+        let reader = match params.get() {
+            Ok(r) => r,
+            Err(e) => return Promise::err(e),
+        };
+        let raw = match reader.get_share_hash() {
+            Ok(d) => d,
+            Err(e) => return Promise::err(e),
+        };
+        if raw.len() != 32 {
+            return Promise::err(capnp::Error::failed(format!(
+                "getShareHeader: shareHash must be 32 bytes, got {}",
+                raw.len()
+            )));
+        }
+        let mut share_hash = [0u8; 32];
+        share_hash.copy_from_slice(raw);
+
+        let mut result: share_header_result::Builder = results.get().init_result();
+        match chain.get_share_header(&share_hash) {
+            Ok(ShareHeaderOutcome::Found {
+                prev_share_blockhash,
+            }) => {
+                let mut found = result.init_found();
+                found.set_prev_share_blockhash(&prev_share_blockhash);
+            }
+            Ok(ShareHeaderOutcome::NotFound) => {
+                result.set_not_found(());
+            }
+            Ok(ShareHeaderOutcome::Genesis) => {
+                result.set_genesis(());
+            }
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!("getShareHeader: {e}")));
+            }
+        }
+        Promise::ok(())
+    }
+
+    #[allow(refining_impl_trait)]
+    fn get_tip_height(
+        self: Rc<Self>,
+        _params: share_chain::GetTipHeightParams,
+        mut results: share_chain::GetTipHeightResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(chain) = self.chain.clone() else {
+            return Promise::err(capnp::Error::unimplemented(
+                "getTipHeight: server has no chain-read backend wired".into(),
+            ));
+        };
+        let mut result: tip_height_result::Builder = results.get().init_result();
+        match chain.get_tip_height() {
+            Ok(Some(h)) => result.set_height(h),
+            Ok(None) => result.set_uninitialised(()),
+            Err(e) => {
+                return Promise::err(capnp::Error::failed(format!("getTipHeight: {e}")));
+            }
+        }
+        Promise::ok(())
+    }
+
+    #[allow(refining_impl_trait)]
+    fn get_network(
+        self: Rc<Self>,
+        _params: share_chain::GetNetworkParams,
+        mut results: share_chain::GetNetworkResults,
+    ) -> Promise<(), capnp::Error> {
+        let Some(chain) = self.chain.clone() else {
+            return Promise::err(capnp::Error::unimplemented(
+                "getNetwork: server has no chain-read backend wired".into(),
+            ));
+        };
+        let mut result: network_result::Builder = results.get().init_result();
+        // bitcoin::Network is `#[non_exhaustive]` in some versions
+        // and exhaustive in others; the wildcard arm is required for
+        // the former and harmless (just unreachable) for the latter.
+        // The schema reserves an `unknown` variant for forward-compat
+        // with future bitcoin networks the schema crate doesn't yet
+        // enumerate.
+        #[allow(unreachable_patterns)]
+        match chain.network() {
+            bitcoin::Network::Bitcoin => result.set_mainnet(()),
+            bitcoin::Network::Testnet => result.set_testnet(()),
+            bitcoin::Network::Testnet4 => result.set_testnet4(()),
+            bitcoin::Network::Regtest => result.set_regtest(()),
+            bitcoin::Network::Signet => result.set_signet(()),
+            _ => result.set_unknown(()),
+        }
+        Promise::ok(())
+    }
 }
 
 /// Bind a Unix socket at `path` and run the IPC server until the socket
@@ -271,6 +464,19 @@ pub async fn run_ipc_server(
     path: impl AsRef<Path>,
     tip_rx: Option<watch::Receiver<bitcoin::BlockHash>>,
 ) -> Result<(), IpcError> {
+    run_ipc_server_with(path, tip_rx, None).await
+}
+
+/// Variant of [`run_ipc_server`] that also wires a chain-read backend
+/// into every accepted connection. The chain-read methods
+/// (`get_chain_tip`, `get_share_header`, `get_tip_height`,
+/// `get_network`) require this backend; without it they return
+/// `capnp::Error::unimplemented`.
+pub async fn run_ipc_server_with(
+    path: impl AsRef<Path>,
+    tip_rx: Option<watch::Receiver<bitcoin::BlockHash>>,
+    chain: Option<Arc<dyn ChainReadBackend>>,
+) -> Result<(), IpcError> {
     let path = path.as_ref();
     // Best-effort cleanup of any stale socket from a prior crash.
     let _ = std::fs::remove_file(path);
@@ -282,6 +488,7 @@ pub async fn run_ipc_server(
     info!(
         socket = %path.display(),
         tip_source = tip_rx.is_some(),
+        chain_backend = chain.is_some(),
         "p2poolv2 IPC server listening"
     );
 
@@ -295,10 +502,13 @@ pub async fn run_ipc_server(
         };
         debug!("Accepted IPC client connection");
 
-        let stub = match tip_rx.clone() {
+        let mut stub = match tip_rx.clone() {
             Some(rx) => ShareChainStub::with_tip_source(rx),
             None => ShareChainStub::new(),
         };
+        if let Some(c) = chain.clone() {
+            stub = stub.with_chain_backend(c);
+        }
         let client: share_chain::Client = capnp_rpc::new_client(stub);
 
         // capnp-rpc requires a single-threaded runtime; spawn each
@@ -347,6 +557,19 @@ pub fn spawn_ipc_server_with_tip_source(
     path: impl Into<PathBuf>,
     tip_rx: Option<watch::Receiver<bitcoin::BlockHash>>,
 ) -> std::thread::JoinHandle<()> {
+    spawn_ipc_server_full(path, tip_rx, None)
+}
+
+/// Variant of [`spawn_ipc_server`] that wires both a tip-watch
+/// receiver and a chain-read backend into every accepted connection.
+/// The chain-read backend is required to serve the read methods
+/// added in the `getChainTip` / `getShareHeader` / `getTipHeight` /
+/// `getNetwork` schema additions.
+pub fn spawn_ipc_server_full(
+    path: impl Into<PathBuf>,
+    tip_rx: Option<watch::Receiver<bitcoin::BlockHash>>,
+    chain: Option<Arc<dyn ChainReadBackend>>,
+) -> std::thread::JoinHandle<()> {
     let path = path.into();
     std::thread::Builder::new()
         .name("p2poolv2-ipc".into())
@@ -363,7 +586,7 @@ pub fn spawn_ipc_server_with_tip_source(
             };
             let local = tokio::task::LocalSet::new();
             local.block_on(&rt, async move {
-                if let Err(e) = run_ipc_server(&path, tip_rx).await {
+                if let Err(e) = run_ipc_server_with(&path, tip_rx, chain).await {
                     error!("IPC server exited: {e}");
                 }
             });
@@ -615,5 +838,212 @@ mod tests {
             }
             _ => panic!("expected InvalidCoinbase variant"),
         }
+    }
+
+    /// In-memory `ChainReadBackend` used to drive the new chain-read
+    /// methods through the capnp RPC layer without standing up a real
+    /// `ChainStoreHandle`.
+    struct FakeChain {
+        tip: Option<[u8; 32]>,
+        height: Option<u32>,
+        network: bitcoin::Network,
+        // Map from share-hash -> prev-share-hash for known headers.
+        headers: std::collections::HashMap<[u8; 32], [u8; 32]>,
+    }
+
+    impl ChainReadBackend for FakeChain {
+        fn get_chain_tip(&self) -> Result<Option<[u8; 32]>, String> {
+            Ok(self.tip)
+        }
+        fn get_share_header(&self, share_hash: &[u8; 32]) -> Result<ShareHeaderOutcome, String> {
+            if share_hash.iter().all(|b| *b == 0) {
+                return Ok(ShareHeaderOutcome::Genesis);
+            }
+            match self.headers.get(share_hash) {
+                Some(prev) => Ok(ShareHeaderOutcome::Found {
+                    prev_share_blockhash: *prev,
+                }),
+                None => Ok(ShareHeaderOutcome::NotFound),
+            }
+        }
+        fn get_tip_height(&self) -> Result<Option<u32>, String> {
+            Ok(self.height)
+        }
+        fn network(&self) -> bitcoin::Network {
+            self.network
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_chain_tip_returns_tip_when_present() {
+        let mut tip = [0u8; 32];
+        tip[31] = 0xab;
+        let chain = Arc::new(FakeChain {
+            tip: Some(tip),
+            height: Some(42),
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+
+        let req = stub.get_chain_tip_request();
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        match result.which().expect("known variant") {
+            chain_tip_result::Which::Tip(bytes) => {
+                let bytes = bytes.expect("bytes");
+                assert_eq!(bytes, &tip[..]);
+            }
+            _ => panic!("expected Tip variant"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_chain_tip_uninitialised_when_no_tip() {
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let reply = stub
+            .get_chain_tip_request()
+            .send()
+            .promise
+            .await
+            .expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        assert!(matches!(
+            result.which().expect("known"),
+            chain_tip_result::Which::Uninitialised(())
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_share_header_genesis_for_zero_hash() {
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let mut req = stub.get_share_header_request();
+        req.get().set_share_hash(&[0u8; 32]);
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        assert!(matches!(
+            result.which().expect("known"),
+            share_header_result::Which::Genesis(())
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_share_header_found_returns_prev() {
+        let mut h = [0u8; 32];
+        h[31] = 0x11;
+        let mut prev = [0u8; 32];
+        prev[31] = 0x22;
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(h, prev);
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers,
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let mut req = stub.get_share_header_request();
+        req.get().set_share_hash(&h);
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        match result.which().expect("known") {
+            share_header_result::Which::Found(reader) => {
+                let r = reader.expect("found");
+                let prev_bytes = r.get_prev_share_blockhash().expect("prev bytes");
+                assert_eq!(prev_bytes, &prev[..]);
+            }
+            _ => panic!("expected Found"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_share_header_not_found_for_unknown_hash() {
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let mut req = stub.get_share_header_request();
+        let mut h = [0u8; 32];
+        h[0] = 0x99;
+        req.get().set_share_hash(&h);
+        let reply = req.send().promise.await.expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        assert!(matches!(
+            result.which().expect("known"),
+            share_header_result::Which::NotFound(())
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_tip_height_round_trips() {
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: Some(99),
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let reply = stub
+            .get_tip_height_request()
+            .send()
+            .promise
+            .await
+            .expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        match result.which().expect("known") {
+            tip_height_result::Which::Height(h) => assert_eq!(h, 99),
+            _ => panic!("expected Height"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_network_round_trips() {
+        let chain = Arc::new(FakeChain {
+            tip: None,
+            height: None,
+            network: bitcoin::Network::Regtest,
+            headers: Default::default(),
+        });
+        let stub: share_chain::Client =
+            capnp_rpc::new_client(ShareChainStub::new().with_chain_backend(chain));
+        let reply = stub
+            .get_network_request()
+            .send()
+            .promise
+            .await
+            .expect("rpc ok");
+        let result = reply.get().expect("reader").get_result().expect("result");
+        assert!(matches!(
+            result.which().expect("known"),
+            network_result::Which::Regtest(())
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn chain_methods_unimplemented_without_backend() {
+        let stub: share_chain::Client = capnp_rpc::new_client(ShareChainStub::new());
+        let err = stub.get_chain_tip_request().send().promise.await;
+        assert!(err.is_err(), "expected unimplemented when no backend wired");
     }
 }

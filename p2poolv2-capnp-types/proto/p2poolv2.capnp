@@ -40,6 +40,32 @@ interface ShareChain {
     # `onNewTip` method is invoked whenever the share-chain tip
     # advances.
     subscribeChainTip @2 (callback :ChainTipCallback);
+
+    # Read the current share-chain tip blockhash. Returns
+    # `uninitialised` when the daemon has not yet completed
+    # genesis setup (mirrors `ChainStoreHandle::get_chain_tip()`
+    # returning a NotFound on the inner store).
+    getChainTip @3 () -> (result :ChainTipResult);
+
+    # Look up a single share header by its share blockhash.
+    # Returns `genesis` for the all-zeros sentinel that marks the
+    # genesis block's predecessor (preserves the engine's existing
+    # genesis-reached check); `notFound` for a missing header;
+    # `found` carrying just the prev_share_blockhash field the
+    # engine consumes today. Other ShareHeader fields are
+    # deliberately not serialised — see the comment on
+    # `ShareHeaderRead`.
+    getShareHeader @4 (shareHash :Data) -> (result :ShareHeaderResult);
+
+    # Read the current confirmed-chain tip height. Returns
+    # `uninitialised` when no confirmed tip exists yet.
+    getTipHeight @5 () -> (result :TipHeightResult);
+
+    # Read the bitcoin network the daemon was configured with. The
+    # client is expected to call this exactly once at startup and
+    # cache the value (the daemon does not support hot-swapping
+    # networks).
+    getNetwork @6 () -> (result :NetworkResult);
 }
 
 struct ValidationResult {
@@ -48,6 +74,68 @@ struct ValidationResult {
         staleChainTip       @1 :Void;
         invalidCoinbase     @2 :Text;
         missingTransactions @3 :List(Data);
+    }
+}
+
+# Result of `getChainTip`. Discriminated to distinguish "no genesis
+# yet" (`uninitialised`) from a real transport error (capnp::Error).
+struct ChainTipResult {
+    union {
+        tip           @0 :Data;   # 32-byte BlockHash
+        uninitialised @1 :Void;
+    }
+}
+
+# Result of `getTipHeight`. Same discrimination as ChainTipResult.
+struct TipHeightResult {
+    union {
+        height        @0 :UInt32;
+        uninitialised @1 :Void;
+    }
+}
+
+# Result of `getShareHeader`. Three-way discrimination:
+#
+# * `found`     — header exists; carries the minimal subset the
+#                 engine actually reads.
+# * `notFound`  — no header for the requested share hash. The
+#                 engine treats this as a truncated walk and
+#                 falls back to invalidate-all.
+# * `genesis`   — the all-zeros sentinel was passed; preserves
+#                 the engine's "stop at genesis" check without
+#                 requiring it to know the all-zeros encoding.
+struct ShareHeaderResult {
+    union {
+        found    @0 :ShareHeaderRead;
+        notFound @1 :Void;
+        genesis  @2 :Void;
+    }
+}
+
+# Minimal subset of `p2poolv2_lib::ShareHeader` exposed to the
+# engine. The engine reads only `prev_share_blockhash` today;
+# every other field on `ShareHeader` (uncles, miner_bitcoin_address,
+# merkle_root, bitcoin_header, bits, time, donation, donation_address,
+# fee, fee_address, coinbase_value, coinbaseaux_flags,
+# witness_commitment, bitcoin_height, coinbase_nsecs, extranonce)
+# is intentionally NOT serialised. If a future contributor needs
+# one of those fields they should add it deliberately and bump the
+# schema rather than reach into the daemon some other way.
+struct ShareHeaderRead {
+    prevShareBlockhash @0 :Data;   # 32-byte BlockHash
+}
+
+# Result of `getNetwork`. Discriminated rather than a bare enum so
+# that "unknown" is representable for forward-compat with future
+# bitcoin networks the schema crate doesn't yet enumerate.
+struct NetworkResult {
+    union {
+        mainnet  @0 :Void;
+        testnet  @1 :Void;
+        testnet4 @2 :Void;
+        regtest  @3 :Void;
+        signet   @4 :Void;
+        unknown  @5 :Void;
     }
 }
 

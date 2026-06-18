@@ -41,6 +41,7 @@ use tracing::{error, info, trace};
 use crate::signal::{ShutdownReason, setup_signal_handler};
 
 mod background_tasks;
+mod ipc_chain;
 mod preflight;
 mod signal;
 
@@ -333,16 +334,25 @@ async fn main() -> ExitCode {
         config.api.hostname, config.api.port
     );
 
-    // Optional Cap'n Proto IPC server (Phase-2 stub). Only started when
-    // `[ipc]` is present in the node config. Real share-chain wiring is
-    // a follow-up PR — see the `p2poolv2_ipc` crate docs and ADR 0010
-    // in the sv2-p2pool repo.
+    // Optional Cap'n Proto IPC server. Only started when `[ipc]` is
+    // present in the node config. The chain-read backend is wired
+    // from the same `ChainStoreHandle` the rest of the daemon uses,
+    // so `getChainTip` / `getShareHeader` / `getTipHeight` /
+    // `getNetwork` serve real data. See ADR 0010 / 0011 in the
+    // sv2-p2pool repo for the boundary the IPC seam enforces.
     let _ipc_handle = config.ipc.as_ref().map(|ipc_cfg| {
         info!(
             socket = %ipc_cfg.socket_path,
-            "Starting p2poolv2 Cap'n Proto IPC server (stub)"
+            "Starting p2poolv2 Cap'n Proto IPC server"
         );
-        p2poolv2_ipc::spawn_ipc_server(ipc_cfg.socket_path.clone())
+        let chain_backend: Arc<dyn p2poolv2_ipc::ChainReadBackend> = Arc::new(
+            ipc_chain::ChainReadAdapter::new(chain_store_handle.clone()),
+        );
+        p2poolv2_ipc::spawn_ipc_server_full(
+            ipc_cfg.socket_path.clone(),
+            None,
+            Some(chain_backend),
+        )
     });
 
     let mut exit_receiver = exit_sender.subscribe();

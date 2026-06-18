@@ -40,7 +40,8 @@
 pub mod server;
 
 pub use server::{
-    ShareChainStub, run_ipc_server, spawn_ipc_server, spawn_ipc_server_with_tip_source,
+    ChainReadBackend, ShareChainStub, ShareHeaderOutcome, run_ipc_server, run_ipc_server_with,
+    spawn_ipc_server, spawn_ipc_server_full, spawn_ipc_server_with_tip_source,
 };
 
 /// Errors emitted by the IPC server.
