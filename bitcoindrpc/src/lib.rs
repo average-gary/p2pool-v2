@@ -119,6 +119,32 @@ pub struct GetBlockchainInfo {
     pub initial_block_download: bool,
 }
 
+/// Outcome of `getblocktemplate` in `proposal` mode.
+///
+/// Bitcoin Core's `getblocktemplate` (BIP 23) replies in proposal mode with:
+/// - `null` (no rejection) → the candidate is a valid block extending the
+///   current tip,
+/// - A string (or, in some forks, an object with a `reject-reason` field)
+///   describing why the proposal was rejected. The special reason
+///   `"duplicate"` means bitcoind already has the block in its chain — for
+///   p2pool's purposes that is still "the block looks valid", just not novel.
+///
+/// The Track B redesign surfaces this richer outcome so that callers
+/// (e.g. SCMJ pre-validation, `submit_solution` book-keeping) can distinguish
+/// the three cases instead of being forced into a `bool`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalOutcome {
+    /// bitcoind considers the proposed block valid relative to its tip
+    /// (response was `null` / contained no reject reason).
+    Accepted,
+    /// bitcoind has already seen this block — `reject-reason == "duplicate"`.
+    /// The block is structurally fine; it just isn't new.
+    Duplicate,
+    /// bitcoind rejected the proposal. The string carries the reject reason
+    /// (e.g. `"bad-prevblk"`, `"high-hash"`, `"inconclusive"`).
+    Rejected(String),
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BitcoindRpcClient {
@@ -342,19 +368,71 @@ impl BitcoindRpcClient {
         Ok(result.to_string())
     }
 
-    /// Validate a proposed bitcoin block by calling getblocktemplate in proposal mode.
-    /// Returns Ok(true) if bitcoind responded "duplicate" (already in chain), Ok(false) otherwise.
+    /// Validate a proposed bitcoin block by calling `getblocktemplate` in
+    /// proposal mode (BIP 23).
+    ///
+    /// Returns a [`ProposalOutcome`]:
+    /// - `Accepted` when bitcoind returns `null` (or an object with no
+    ///   `reject-reason` field) — the candidate is a valid block.
+    /// - `Duplicate` when the reject reason is `"duplicate"` — the block is
+    ///   already in bitcoind's chain. p2pool treats this as "structurally
+    ///   fine, just not novel".
+    /// - `Rejected(reason)` for any other reject reason.
     pub async fn validate_block_proposal(
         &self,
         block: &bitcoin::Block,
-    ) -> Result<bool, BitcoindRpcError> {
+    ) -> Result<ProposalOutcome, BitcoindRpcError> {
         let block_hex = hex::encode(bitcoin::consensus::encode::serialize(block));
         let params = vec![serde_json::json!({
             "mode": "proposal",
             "data": block_hex,
         })];
         let response: serde_json::Value = self.request("getblocktemplate", params).await?;
-        Ok(response == "duplicate")
+        Ok(parse_proposal_outcome(&response))
+    }
+}
+
+/// Pure parser for the `getblocktemplate` proposal-mode response.
+///
+/// Bitcoin Core has historically returned the reject-reason in a couple of
+/// shapes depending on version / fork:
+/// - JSON `null` for an accepted proposal.
+/// - A bare string (e.g. `"duplicate"`, `"bad-prevblk"`).
+/// - An object with a `reject-reason` field (BIP 23 long form), in which case
+///   the absence of that field also indicates acceptance.
+///
+/// We accept all three shapes here so callers don't have to. The function is
+/// `pub(crate)` so it can be unit-tested without an HTTP round-trip.
+pub(crate) fn parse_proposal_outcome(response: &serde_json::Value) -> ProposalOutcome {
+    // 1. Explicit `null` → accepted.
+    if response.is_null() {
+        return ProposalOutcome::Accepted;
+    }
+
+    // 2. Bare string reject-reason (legacy / common in tests).
+    if let Some(reason) = response.as_str() {
+        if reason.is_empty() {
+            return ProposalOutcome::Accepted;
+        }
+        if reason == "duplicate" {
+            return ProposalOutcome::Duplicate;
+        }
+        return ProposalOutcome::Rejected(reason.to_string());
+    }
+
+    // 3. Object shape: look for `reject-reason`.
+    if let Some(obj) = response.as_object() {
+        match obj.get("reject-reason") {
+            None => ProposalOutcome::Accepted,
+            Some(serde_json::Value::Null) => ProposalOutcome::Accepted,
+            Some(serde_json::Value::String(s)) if s == "duplicate" => ProposalOutcome::Duplicate,
+            Some(serde_json::Value::String(s)) => ProposalOutcome::Rejected(s.clone()),
+            Some(other) => ProposalOutcome::Rejected(other.to_string()),
+        }
+    } else {
+        // Anything else (number, array, bool) is treated as a rejection so we
+        // surface the unexpected payload rather than silently accept.
+        ProposalOutcome::Rejected(response.to_string())
     }
 }
 
@@ -389,11 +467,14 @@ pub trait BitcoindLike: Send + Sync {
     async fn submit_block(&self, block: &bitcoin::Block) -> Result<String, BitcoindRpcError>;
 
     /// Validate a candidate block via `getblocktemplate` proposal mode.
-    /// Returns true if bitcoind reports "duplicate".
+    ///
+    /// Returns a [`ProposalOutcome`] so callers can distinguish accepted,
+    /// duplicate, and rejected (with reason) outcomes. See
+    /// [`BitcoindRpcClient::validate_block_proposal`] for the wire details.
     async fn validate_block_proposal(
         &self,
         block: &bitcoin::Block,
-    ) -> Result<bool, BitcoindRpcError>;
+    ) -> Result<ProposalOutcome, BitcoindRpcError>;
 }
 
 #[async_trait]
@@ -427,7 +508,7 @@ impl BitcoindLike for BitcoindRpcClient {
     async fn validate_block_proposal(
         &self,
         block: &bitcoin::Block,
-    ) -> Result<bool, BitcoindRpcError> {
+    ) -> Result<ProposalOutcome, BitcoindRpcError> {
         BitcoindRpcClient::validate_block_proposal(self, block).await
     }
 }
@@ -841,5 +922,71 @@ mod tests {
         } else {
             panic!("Expected BitcoindRpcError::HttpError, got {result:?}");
         }
+    }
+
+    // ---- parse_proposal_outcome unit tests ----------------------------------
+
+    #[test]
+    fn proposal_outcome_null_is_accepted() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::Value::Null),
+            ProposalOutcome::Accepted,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_empty_string_is_accepted() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!("")),
+            ProposalOutcome::Accepted,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_duplicate_string() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!("duplicate")),
+            ProposalOutcome::Duplicate,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_rejected_string() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!("bad-prevblk")),
+            ProposalOutcome::Rejected("bad-prevblk".to_string()),
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_object_without_reject_reason_is_accepted() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!({})),
+            ProposalOutcome::Accepted,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_object_with_null_reject_reason_is_accepted() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!({ "reject-reason": null })),
+            ProposalOutcome::Accepted,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_object_with_duplicate_reject_reason() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!({ "reject-reason": "duplicate" })),
+            ProposalOutcome::Duplicate,
+        );
+    }
+
+    #[test]
+    fn proposal_outcome_object_with_other_reject_reason() {
+        assert_eq!(
+            parse_proposal_outcome(&serde_json::json!({ "reject-reason": "high-hash" })),
+            ProposalOutcome::Rejected("high-hash".to_string()),
+        );
     }
 }

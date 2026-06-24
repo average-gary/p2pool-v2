@@ -24,7 +24,7 @@
 //!
 //! Available under `#[cfg(test)]` and via the `test-utils` feature.
 
-use crate::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo};
+use crate::{BitcoindLike, BitcoindRpcError, GetBlockchainInfo, ProposalOutcome};
 use async_trait::async_trait;
 use std::sync::Mutex;
 
@@ -46,7 +46,7 @@ struct Inner {
     block_template: Option<Result<String, BitcoindRpcError>>,
     decoded_tx: Option<Result<bitcoin::Transaction, BitcoindRpcError>>,
     submit_block_response: Option<Result<String, BitcoindRpcError>>,
-    proposal_response: Option<Result<bool, BitcoindRpcError>>,
+    proposal_response: Option<Result<ProposalOutcome, BitcoindRpcError>>,
     submitted_blocks: Vec<bitcoin::Block>,
     decoded_txs: Vec<bitcoin::Transaction>,
 }
@@ -88,8 +88,12 @@ impl MockBitcoind {
     }
 
     /// Script the next [`BitcoindLike::validate_block_proposal`] response.
-    pub fn with_proposal_response(self, accepted_as_duplicate: bool) -> Self {
-        self.inner.lock().unwrap().proposal_response = Some(Ok(accepted_as_duplicate));
+    ///
+    /// Pass a [`ProposalOutcome`] directly so tests express intent —
+    /// `Accepted`, `Duplicate`, or `Rejected(reason)` — rather than encoding
+    /// "duplicate?" in a `bool`.
+    pub fn with_proposal_outcome(self, outcome: ProposalOutcome) -> Self {
+        self.inner.lock().unwrap().proposal_response = Some(Ok(outcome));
         self
     }
 
@@ -180,14 +184,14 @@ impl BitcoindLike for MockBitcoind {
     async fn validate_block_proposal(
         &self,
         _block: &bitcoin::Block,
-    ) -> Result<bool, BitcoindRpcError> {
+    ) -> Result<ProposalOutcome, BitcoindRpcError> {
         self.inner
             .lock()
             .unwrap()
             .proposal_response
             .as_ref()
             .map(|r| match r {
-                Ok(v) => Ok(*v),
+                Ok(v) => Ok(v.clone()),
                 Err(e) => Err(BitcoindRpcError::Other(e.to_string())),
             })
             .unwrap_or_else(|| Err(unscripted("validate_block_proposal")))
