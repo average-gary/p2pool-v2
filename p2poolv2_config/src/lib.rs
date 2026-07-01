@@ -20,6 +20,7 @@ use bitcoindrpc::BitcoinRpcConfig;
 use serde::Deserialize;
 use std::marker::PhantomData;
 use std::str::FromStr;
+use std::time::Duration;
 
 /// Error type for configuration parsing and validation.
 #[derive(Debug, Clone)]
@@ -389,6 +390,18 @@ pub struct IpcConfig {
     /// Filesystem path of the Unix socket to bind. Absolute paths are
     /// recommended; the parent directory must exist and be writable.
     pub socket_path: String,
+    /// Optional per-request IPC timeout applied by downstream clients
+    /// (e.g. sv2-p2pool's `IpcChain`). When `None`, the client falls
+    /// back to its own default (5s in the sv2-p2pool pool binary).
+    /// Values are parsed with humantime (`"5s"`, `"250ms"`, ...).
+    #[serde(default, with = "humantime_serde::option")]
+    pub request_timeout: Option<Duration>,
+    /// Optional connect-phase IPC timeout applied by downstream
+    /// clients. When `None`, the client falls back to its own default
+    /// (30s in the sv2-p2pool pool binary). Values are parsed with
+    /// humantime (`"30s"`, `"1m"`, ...).
+    #[serde(default, with = "humantime_serde::option")]
+    pub connect_timeout: Option<Duration>,
 }
 
 /// Config for p2poolv2 nodes

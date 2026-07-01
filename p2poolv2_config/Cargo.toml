@@ -19,6 +19,7 @@ test-utils = []
 bitcoin = { workspace = true }
 bitcoindrpc = { workspace = true }
 config = { workspace = true }
+humantime-serde = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
