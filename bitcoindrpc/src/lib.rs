@@ -22,6 +22,7 @@ use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tracing::{debug, error};
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -145,6 +146,13 @@ pub enum ProposalOutcome {
     Rejected(String),
 }
 
+/// Overall HTTP request timeout for every call `BitcoindRpcClient` makes to
+/// bitcoind. Applies to all callers of `BitcoindRpcClient` across the workspace
+/// (p2poolv2_lib stratum/*, p2poolv2_node/preflight, downstream sv2-p2pool
+/// engine, etc.). Modifying this constant affects all downstream crates.
+/// Hard-coded default; make configurable if operator SLOs demand it.
+const BITCOIND_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct BitcoindRpcClient {
@@ -168,6 +176,7 @@ impl BitcoindRpcClient {
 
         let client = reqwest::Client::builder()
             .default_headers(headers)
+            .timeout(BITCOIND_RPC_TIMEOUT)
             .build()
             .map_err(|e| BitcoindRpcError::Other(format!("Failed to create HTTP client: {e}")))?;
 
@@ -255,6 +264,16 @@ impl BitcoindRpcClient {
 
     /// Get current bitcoin block count from bitcoind rpc
     /// We use special rules for signet
+    ///
+    /// # Timeout budget
+    ///
+    /// Each underlying `request` call is bounded by the
+    /// [`BITCOIND_RPC_TIMEOUT`] HTTP timeout (10s). This function retries
+    /// (`MAX_RETRIES == 5`, so up to 6 attempts total) with a short exponential
+    /// backoff, which means the caller-visible worst-case wall-clock on a fully
+    /// wedged bitcoind is approximately 6 * 10s + backoff (~60s), not 10s.
+    /// [`validate_block_proposal`](Self::validate_block_proposal) uses
+    /// [`request`](Self::request) directly and gets the clean 10s budget.
     pub async fn getblocktemplate(
         &self,
         network: bitcoin::Network,
@@ -889,6 +908,52 @@ mod tests {
         assert!(result.is_ok());
         let result_value = serde_json::from_str::<serde_json::Value>(&result.unwrap()).unwrap();
         assert_eq!(result_value.get("height").unwrap(), 1000000);
+    }
+
+    #[tokio::test]
+    async fn client_request_times_out_on_slow_server() {
+        // Regression: a slow / wedged bitcoind must not hang the RPC client
+        // indefinitely. The reqwest builder in BitcoindRpcClient::new applies
+        // BITCOIND_RPC_TIMEOUT (10s) as the overall request-lifecycle cap, so
+        // a 15s server-side delay must be observable as an Err from the inner
+        // call before an outer 12s tokio::time::timeout envelope fires.
+        //
+        // The outer envelope makes the assertion deterministic: if the inner
+        // timeout ever regresses (e.g. someone drops .timeout(...) from the
+        // builder chain), the test elapses the outer 12s and fails via the
+        // "outer envelope fired" branch rather than hanging forever.
+        //
+        // We deliberately do NOT string-match on the reqwest error message —
+        // its Display representation churns across versions.
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "result": { "initialblockdownload": false },
+                        "error": null,
+                        "id": 0,
+                    }))
+                    .set_delay(Duration::from_secs(15)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = BitcoindRpcClient::new(&mock_server.uri(), "p2pool", "p2pool").unwrap();
+
+        let rpc_call = client.getblockchaininfo();
+        let outer = tokio::time::timeout(Duration::from_secs(12), rpc_call).await;
+
+        // Outer envelope must NOT fire — the inner 10s reqwest timeout should
+        // resolve first.
+        let inner = outer.expect("outer 12s envelope fired before inner 10s reqwest timeout");
+        // The inner call must be an Err (reqwest's overall timeout tripped).
+        assert!(
+            inner.is_err(),
+            "expected inner Err from reqwest timeout, got Ok: {inner:?}"
+        );
     }
 
     #[tokio::test]
